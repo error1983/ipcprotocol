@@ -13,9 +13,9 @@ import (
 
 // 错误包类型码（与 JS 版 ERROR_TYPES 一致）。
 const (
-	ErrLengthCRCFailed = 1
+	ErrLengthCRCFailed  = 1
 	ErrMessageCRCFailed = 2
-	ErrBufferOverflow  = 3
+	ErrBufferOverflow   = 3
 )
 
 const defaultMaxBufferSize = 256 * 1024 * 1024
