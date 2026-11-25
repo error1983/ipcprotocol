@@ -190,6 +190,10 @@ func (rpc *RpcProtocol) handleMessage(data []byte) {
 	content, err := deserialize(contentType, payload)
 	if err != nil {
 		log.Printf("[ipc] deserialize failed: %v", err)
+		// 畸形 REQUEST 尽量回错误响应，避免调用方永久等待（对齐 JS 修复版）
+		if msgType == TypeRequest {
+			rpc.sendErrorResponse(id, "Invalid request payload")
+		}
 		return
 	}
 
@@ -213,6 +217,13 @@ func (rpc *RpcProtocol) handleMessage(data []byte) {
 	}
 }
 
+func (rpc *RpcProtocol) sendErrorResponse(id, msg string) {
+	body, _ := json.Marshal(map[string]any{"error": msg})
+	if err := rpc.ms.Send(buildMessage(TypeResponse, ContentJSON, id, body)); err != nil {
+		log.Printf("[ipc] send error response failed: %v", err)
+	}
+}
+
 func (rpc *RpcProtocol) handleRequest(id string, contentType int, content any, raw []byte) {
 	var method string
 	var args []any
@@ -221,6 +232,7 @@ func (rpc *RpcProtocol) handleRequest(id string, contentType int, content any, r
 		m, binArgs, err := decodeBinaryRequest(raw)
 		if err != nil {
 			log.Printf("[ipc] bad binary request: %v", err)
+			rpc.sendErrorResponse(id, "Invalid request payload: "+err.Error())
 			return
 		}
 		method, args = m, binArgs
@@ -228,10 +240,15 @@ func (rpc *RpcProtocol) handleRequest(id string, contentType int, content any, r
 		m, ok := content.(map[string]any)
 		if !ok {
 			log.Printf("[ipc] invalid request content")
+			rpc.sendErrorResponse(id, "Invalid request payload: not an object")
 			return
 		}
 		method, _ = m["method"].(string)
 		args = expandParams(m["params"])
+	}
+	if method == "" {
+		rpc.sendErrorResponse(id, "Invalid request payload: method missing")
+		return
 	}
 
 	rpc.handlersMu.Lock()

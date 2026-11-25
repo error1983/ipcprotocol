@@ -42,7 +42,10 @@ public sealed class MessageStream : IDisposable
     private readonly Stream _stream;
     private readonly bool _enableCRC;
     private readonly long _maxBufferSize;
-    private readonly List<byte> _buffer = new();
+    // 接收缓冲：byte[] + 头游标，消费只前移游标，避免 O(n^2) 头部删除
+    private byte[] _buffer = Array.Empty<byte>();
+    private int _head;
+    private int _count;
     private int? _expectedLength;
     private bool _protocolMode;
     private readonly SemaphoreSlim _sendLock = new(1, 1);
@@ -150,6 +153,52 @@ public sealed class MessageStream : IDisposable
         }
     }
 
+    // ========== 缓冲辅助（头游标 + 摊还 compact） ==========
+
+    private ReadOnlySpan<byte> Buf => _buffer.AsSpan(_head, _count);
+
+    private void Append(ReadOnlySpan<byte> data)
+    {
+        if (_head + _count + data.Length > _buffer.Length)
+        {
+            int need = _head + _count + data.Length;
+            int cap = _buffer.Length == 0 ? 4096 : _buffer.Length;
+            while (cap < need) cap *= 2;
+            var grown = new byte[cap];
+            _buffer.AsSpan(_head, _count).CopyTo(grown);
+            _buffer = grown;
+            _head = 0;
+        }
+        data.CopyTo(_buffer.AsSpan(_head + _count));
+        _count += data.Length;
+    }
+
+    private void Consume(int n)
+    {
+        _head += n;
+        _count -= n;
+        if (_head >= 1024 * 1024 || _head >= _count)
+        {
+            _buffer.AsSpan(_head, _count).CopyTo(_buffer);
+            _head = 0;
+        }
+    }
+
+    private void ClearBuffer()
+    {
+        _head = 0;
+        _count = 0;
+    }
+
+    private uint ReadU32(int offset) => BinaryPrimitives.ReadUInt32LittleEndian(Buf.Slice(offset));
+
+    private int FindProtocolHeader()
+    {
+        int window = Math.Min(_count, 64 * 1024);
+        if (window < 4) return -1;
+        return Buf.Slice(0, window).IndexOf(ProtocolHeader);
+    }
+
     // ========== 接收 ==========
 
     private async Task ReadLoopAsync(CancellationToken ct)
@@ -174,58 +223,54 @@ public sealed class MessageStream : IDisposable
 
     private void OnData(ReadOnlySpan<byte> data)
     {
-        _buffer.AddRange(data.ToArray());
+        Append(data);
 
-        if (_buffer.Count > _maxBufferSize)
+        if (_count > _maxBufferSize)
         {
-            Error?.Invoke(new InvalidOperationException($"Buffer size: {_buffer.Count} exceeds maximum allowed limit"));
+            Error?.Invoke(new InvalidOperationException($"Buffer size: {_count} exceeds maximum allowed limit"));
             _ = SendErrorAsync("BUFFER_OVERFLOW");
             Reset();
             return;
         }
 
-        while (_buffer.Count > 0)
+        while (_count > 0)
         {
-            var span = System.Runtime.InteropServices.CollectionsMarshal.AsSpan(_buffer);
-
-            // 协议模式：只接受协议消息
-            if (_protocolMode && _buffer.Count >= 8)
+            // 协议模式：扫描协议头，而不是整段丢弃（避免误丢 RESET_CONFIRM）
+            if (_protocolMode)
             {
-                if (BinaryPrimitives.ReadUInt32LittleEndian(span) == 0xFFFFFFFF)
+                int idx = FindProtocolHeader();
+                if (idx >= 0)
                 {
-                    uint length = BinaryPrimitives.ReadUInt32LittleEndian(span.Slice(4));
-                    long total = 8 + length;
-                    if (_buffer.Count >= total)
+                    Consume(idx);
+                    if (_count < 8) break; // 等待长度字段
+                    uint length = ReadU32(4);
+                    if (length > 50)
                     {
-                        var messageData = span.Slice(8, (int)length).ToArray();
-                        _buffer.RemoveRange(0, (int)total);
-                        if (HandleProtocolMessage(messageData)) continue;
+                        Consume(8); // 伪头：跳过继续扫描
+                        continue;
                     }
-                    else break; // 等待更多数据
+                    if (_count < 8 + (int)length) break; // 等待协议消息收全
+                    var messageData = Buf.Slice(8, (int)length).ToArray();
+                    Consume(8 + (int)length);
+                    HandleProtocolMessage(messageData);
+                    continue;
                 }
-                else
-                {
-                    // 协议模式下的残留数据，丢弃
-                    Console.WriteLine("[MessageStream] Dropping non-protocol data in protocol mode");
-                    _buffer.Clear();
-                    break;
-                }
+                // 窗口内无协议头：丢弃已扫描部分，保留尾部 3 字节（可能半截头）
+                Consume(_count - Math.Min(3, _count));
+                break;
             }
-
-            if (_protocolMode) break; // 等待协议同步完成
 
             // 正常模式
             if (_expectedLength is null)
             {
                 int headerSize = _enableCRC ? 8 : 4;
-                if (_buffer.Count < headerSize) break;
+                if (_count < headerSize) break;
 
-                span = System.Runtime.InteropServices.CollectionsMarshal.AsSpan(_buffer);
-                uint length = BinaryPrimitives.ReadUInt32LittleEndian(span);
+                uint length = ReadU32(0);
                 if (_enableCRC)
                 {
-                    uint expectedCRC = BinaryPrimitives.ReadUInt32LittleEndian(span.Slice(4));
-                    uint calculated = Crc32(span.Slice(0, 4));
+                    uint expectedCRC = ReadU32(4);
+                    uint calculated = Crc32(Buf.Slice(0, 4));
                     if (calculated != expectedCRC)
                     {
                         Console.Error.WriteLine($"Length header CRC check failed: expected {expectedCRC}, got {calculated}");
@@ -236,19 +281,28 @@ public sealed class MessageStream : IDisposable
                     }
                 }
 
+                // 长度头强制校验：0 或超限视为坏帧（先用 uint/long 比较，避免 cast 溢出）
+                if (length == 0 || length > (ulong)_maxBufferSize)
+                {
+                    string code = length > (ulong)_maxBufferSize ? "BUFFER_OVERFLOW" : "LENGTH_CRC_FAILED";
+                    _ = SendErrorAsync(code);
+                    Error?.Invoke(new InvalidDataException($"invalid frame length {length}"));
+                    Reset();
+                    return;
+                }
+
                 _expectedLength = (int)length;
-                _buffer.RemoveRange(0, headerSize);
+                Consume(headerSize);
             }
 
             int expected = _expectedLength.Value;
             int messageTotalSize = _enableCRC ? expected + 4 : expected;
-            if (_buffer.Count >= messageTotalSize)
+            if (_count >= messageTotalSize)
             {
-                span = System.Runtime.InteropServices.CollectionsMarshal.AsSpan(_buffer);
-                var messageData = span.Slice(0, expected).ToArray();
+                var messageData = Buf.Slice(0, expected).ToArray();
                 if (_enableCRC)
                 {
-                    uint messageCRC = BinaryPrimitives.ReadUInt32LittleEndian(span.Slice(expected));
+                    uint messageCRC = ReadU32(expected);
                     uint calculated = Crc32(messageData);
                     if (calculated != messageCRC)
                     {
@@ -260,7 +314,7 @@ public sealed class MessageStream : IDisposable
                     }
                 }
 
-                _buffer.RemoveRange(0, messageTotalSize);
+                Consume(messageTotalSize);
                 _expectedLength = null;
 
                 // 错误包在交给上层之前拦截处理
@@ -280,20 +334,17 @@ public sealed class MessageStream : IDisposable
         }
     }
 
-    private bool HandleProtocolMessage(byte[] messageData)
+    private void HandleProtocolMessage(byte[] messageData)
     {
-        if (messageData.Length > 50) return false;
         var text = System.Text.Encoding.UTF8.GetString(messageData).Trim();
         if (text == "RESET_CONFIRM")
         {
             Console.WriteLine("Received reset confirmation");
             _protocolMode = false;
-            _buffer.Clear();
+            ClearBuffer();
             _expectedLength = null;
             SyncComplete?.Invoke();
-            return true;
         }
-        return false;
     }
 
     private static bool IsErrorPacket(byte[] data)
@@ -303,14 +354,14 @@ public sealed class MessageStream : IDisposable
     public void Reset()
     {
         Console.WriteLine("[MessageStream] Resetting stream state");
-        _buffer.Clear();
+        ClearBuffer();
         _expectedLength = null;
         _protocolMode = true;
     }
 
     public object GetStatus() => new
     {
-        bufferLength = _buffer.Count,
+        bufferLength = _count,
         expectedLength = _expectedLength,
         enableCRC = _enableCRC,
         protocolMode = _protocolMode,
@@ -322,7 +373,7 @@ public sealed class MessageStream : IDisposable
         _disposed = true;
         _cts.Cancel();
         try { _stream.Dispose(); } catch { /* ignore */ }
-        _buffer.Clear();
+        ClearBuffer();
         Message = null;
         Error = null;
         SyncComplete = null;

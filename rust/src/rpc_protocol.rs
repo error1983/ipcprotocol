@@ -194,6 +194,10 @@ fn handle_message(
         Ok(c) => c,
         Err(e) => {
             eprintln!("[ipc] deserialize failed: {}", e);
+            // 畸形 REQUEST 尽量回错误响应，避免调用方永久等待（对齐 JS 修复版）
+            if msg_type == TYPE_REQUEST {
+                send_error_response(ms, &id, "Invalid request payload");
+            }
             return;
         }
     };
@@ -229,6 +233,15 @@ fn handle_message(
     }
 }
 
+fn send_error_response(ms: &MessageStream, id: &str, msg: &str) {
+    let mut e = Json::obj();
+    e.insert("error", Json::Str(msg.to_string()));
+    let body = json::stringify(&e).into_bytes();
+    if let Err(err) = ms.send(&build_message(TYPE_RESPONSE, CONTENT_JSON, id, &body)) {
+        eprintln!("[ipc] send error response failed: {}", err);
+    }
+}
+
 fn handle_request(
     id: &str,
     content_type: u8,
@@ -242,14 +255,23 @@ fn handle_request(
             Ok(v) => v,
             Err(e) => {
                 eprintln!("[ipc] bad binary request: {}", e);
+                send_error_response(ms, id, &format!("Invalid request payload: {}", e));
                 return;
             }
         }
     } else {
+        if !matches!(content, Json::Obj(_)) {
+            send_error_response(ms, id, "Invalid request payload: not an object");
+            return;
+        }
         let method = content.get("method").and_then(|m| m.as_str()).unwrap_or("").to_string();
         let args = expand_params(content.get("params").cloned().unwrap_or(Json::Null));
         (method, args)
     };
+    if method.is_empty() {
+        send_error_response(ms, id, "Invalid request payload: method missing");
+        return;
+    }
 
     // 取出处理器引用后立即释放锁，避免长时间持锁阻塞其他请求
     let handler = handlers.lock().unwrap().get(&method).cloned();

@@ -208,6 +208,10 @@ private:
         try {
             content = deserialize(contentType, payload, payloadLen);
         } catch (...) {
+            // 畸形 REQUEST 尽量回错误响应，避免调用方永久等待（对齐 JS 修复版）
+            if (msgType == TYPE_REQUEST) {
+                sendErrorResponse(ms, id, "Invalid request payload");
+            }
             return; // 解析失败：丢弃，不影响后续消息
         }
 
@@ -240,20 +244,40 @@ private:
         }
     }
 
+    static void sendErrorResponse(const std::shared_ptr<MessageStream>& ms, const std::string& id,
+                                  const std::string& msg) {
+        std::string body = Json::object().set("error", Json::ofStr(msg)).dump();
+        ms->send(buildMessage(TYPE_RESPONSE, CONTENT_JSON, id,
+                              reinterpret_cast<const uint8_t*>(body.data()), body.size()));
+    }
+
     static void handleRequest(const std::string& id, uint8_t contentType, const Json& content,
                               const std::vector<uint8_t>& raw, const std::shared_ptr<State>& state,
                               const std::shared_ptr<MessageStream>& ms) {
         std::string method;
         std::vector<Json> args;
         if (contentType == CONTENT_BINARY) {
-            if (!decodeBinaryRequest(raw, method, args)) return;
+            if (!decodeBinaryRequest(raw, method, args)) {
+                sendErrorResponse(ms, id, "Invalid request payload: bad binary request");
+                return;
+            }
         } else {
-            if (content.type != Json::Type::Obj) return;
+            if (content.type != Json::Type::Obj) {
+                sendErrorResponse(ms, id, "Invalid request payload: not an object");
+                return;
+            }
             const Json* m = content.find("method");
-            if (!m || m->type != Json::Type::Str) return;
+            if (!m || m->type != Json::Type::Str) {
+                sendErrorResponse(ms, id, "Invalid request payload: method missing");
+                return;
+            }
             method = m->str;
             const Json* params = content.find("params");
             args = expandParams(params ? *params : Json::null());
+        }
+        if (method.empty()) {
+            sendErrorResponse(ms, id, "Invalid request payload: method missing");
+            return;
         }
 
         Handler handler;

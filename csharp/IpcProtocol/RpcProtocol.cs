@@ -146,9 +146,15 @@ public sealed class RpcProtocol : IDisposable
     public static (string Method, JsonElement Params, byte[] BinaryData) DecodeBinaryRequest(byte[] buffer)
     {
         int offset = 0;
+        if (buffer.Length < 4)
+            throw new InvalidDataException("binary request too short");
         uint methodLength = BinaryPrimitives.ReadUInt32BigEndian(buffer.AsSpan(offset)); offset += 4;
+        if (buffer.Length < offset + (long)methodLength + 4)
+            throw new InvalidDataException("binary request truncated (method)");
         string method = Encoding.UTF8.GetString(buffer, offset, (int)methodLength); offset += (int)methodLength;
         uint paramsLength = BinaryPrimitives.ReadUInt32BigEndian(buffer.AsSpan(offset)); offset += 4;
+        if (buffer.Length < offset + (long)paramsLength)
+            throw new InvalidDataException("binary request truncated (params)");
         var parameters = JsonDocument.Parse(buffer.AsMemory(offset, (int)paramsLength)).RootElement.Clone(); offset += (int)paramsLength;
         return (method, parameters, buffer.AsSpan(offset).ToArray());
     }
@@ -179,6 +185,17 @@ public sealed class RpcProtocol : IDisposable
         catch (Exception err)
         {
             Console.Error.WriteLine($"Failed to handle message: {err.Message}");
+            // 畸形 REQUEST 尽量回错误响应，避免调用方永久等待（对齐 JS 修复版）
+            if (buffer.Length >= 18 && buffer[0] == Types.Request)
+            {
+                try
+                {
+                    string hex = System.Convert.ToHexString(buffer, 2, 16).ToLowerInvariant();
+                    string id = $"{hex[..8]}-{hex[8..12]}-{hex[12..16]}-{hex[16..20]}-{hex[20..]}";
+                    _ = SendResponseAsync(id, new { error = "Invalid request payload" });
+                }
+                catch { /* ignore */ }
+            }
         }
     }
 
@@ -187,32 +204,41 @@ public sealed class RpcProtocol : IDisposable
         string? method;
         object?[] args;
 
-        if (request is byte[] binary)
+        try
         {
-            var (m, parameters, binaryData) = DecodeBinaryRequest(binary);
-            method = m;
-            var list = new List<object?> { binaryData };
-            if (parameters.ValueKind == JsonValueKind.Array)
-                foreach (var item in parameters.EnumerateArray()) list.Add(item);
-            args = list.ToArray();
-        }
-        else if (request is JsonElement json && json.ValueKind == JsonValueKind.Object)
-        {
-            method = json.TryGetProperty("method", out var m) ? m.GetString() : null;
-            if (json.TryGetProperty("params", out var p) && p.ValueKind == JsonValueKind.Array)
-                args = p.EnumerateArray().Cast<object?>().ToArray();
-            else if (json.TryGetProperty("params", out p) && p.ValueKind != JsonValueKind.Null && p.ValueKind != JsonValueKind.Undefined)
-                args = new object?[] { p };
+            if (request is byte[] binary)
+            {
+                var (m, parameters, binaryData) = DecodeBinaryRequest(binary);
+                method = m;
+                var list = new List<object?> { binaryData };
+                if (parameters.ValueKind == JsonValueKind.Array)
+                    foreach (var item in parameters.EnumerateArray()) list.Add(item);
+                args = list.ToArray();
+            }
+            else if (request is JsonElement json && json.ValueKind == JsonValueKind.Object)
+            {
+                method = json.TryGetProperty("method", out var m) && m.ValueKind == JsonValueKind.String ? m.GetString() : null;
+                if (json.TryGetProperty("params", out var p) && p.ValueKind == JsonValueKind.Array)
+                    args = p.EnumerateArray().Cast<object?>().ToArray();
+                else if (json.TryGetProperty("params", out p) && p.ValueKind != JsonValueKind.Null && p.ValueKind != JsonValueKind.Undefined)
+                    args = new object?[] { p };
+                else
+                    args = Array.Empty<object?>();
+            }
             else
-                args = Array.Empty<object?>();
+            {
+                throw new InvalidDataException("request payload is not an object");
+            }
+            if (string.IsNullOrEmpty(method))
+                throw new InvalidDataException("request method missing");
         }
-        else
+        catch (Exception err)
         {
-            method = null;
-            args = Array.Empty<object?>();
+            await SendResponseAsync(id, new { error = $"Invalid request payload: {err.Message}" }).ConfigureAwait(false);
+            return;
         }
 
-        if (method is null || !_handlers.TryGetValue(method, out var handler))
+        if (!_handlers.TryGetValue(method, out var handler))
         {
             await SendResponseAsync(id, new { error = $"Method not found: {method}" }).ConfigureAwait(false);
             return;

@@ -1,23 +1,34 @@
 #include "message_stream.h"
 
 #include <pthread.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-typedef struct { unsigned char* data; size_t len, cap; } Buf;
+typedef struct { unsigned char* data; size_t head, len, cap; } Buf;
 
 static void buf_append(Buf* b, const unsigned char* data, size_t n) {
-    if (b->len + n > b->cap) {
-        while (b->len + n > b->cap) b->cap = b->cap ? b->cap * 2 : 4096;
+    if (b->head + b->len + n > b->cap) {
+        while (b->head + b->len + n > b->cap) b->cap = b->cap ? b->cap * 2 : 4096;
         b->data = (unsigned char*)realloc(b->data, b->cap);
     }
-    memcpy(b->data + b->len, data, n);
+    memcpy(b->data + b->head + b->len, data, n);
     b->len += n;
 }
 
+/* 消费只前移游标，避免 O(n^2) 全量前移；达阈值时摊还 compact */
 static void buf_consume(Buf* b, size_t n) {
-    memmove(b->data, b->data + n, b->len - n);
+    b->head += n;
     b->len -= n;
+    if (b->head >= 1024 * 1024 || b->head >= b->len) {
+        memmove(b->data, b->data + b->head, b->len);
+        b->head = 0;
+    }
+}
+
+static void buf_clear(Buf* b) {
+    b->head = 0;
+    b->len = 0;
 }
 
 static unsigned read_le32(const unsigned char* p) {
@@ -103,7 +114,7 @@ static void emit_error(MessageStream* ms, const char* msg) {
 
 static void ms_reset(MessageStream* ms) {
     ms->protocolMode = 1;
-    ms->buf.len = 0;
+    buf_clear(&ms->buf);
     ms->expectedLen = -1;
 }
 
@@ -151,46 +162,67 @@ static void process_buffer(MessageStream* ms) {
             return;
         }
         if (ms->protocolMode) {
-            if (ms->buf.len >= 8) {
-                if (read_le32(ms->buf.data) == 0xFFFFFFFFu) {
-                    unsigned length = read_le32(ms->buf.data + 4);
-                    if (length <= 50 && ms->buf.len >= 8 + length) {
-                        char text[64];
-                        memcpy(text, ms->buf.data + 8, length);
-                        text[length] = '\0';
-                        buf_consume(&ms->buf, 8 + length);
-                        /* trim */
-                        char* t = text;
-                        while (*t == ' ' || *t == '\t' || *t == '\n' || *t == '\r') t++;
-                        size_t n = strlen(t);
-                        while (n > 0 && (t[n - 1] == ' ' || t[n - 1] == '\t' || t[n - 1] == '\n' || t[n - 1] == '\r')) n--;
-                        t[n] = '\0';
-                        if (strcmp(t, "RESET_CONFIRM") == 0) {
-                            ms->protocolMode = 0;
-                            ms->buf.len = 0;
-                            if (ms->on_sync) ms->on_sync(ms->on_sync_user);
-                        }
-                        continue;
-                    }
-                    return; /* 协议消息未收全 */
-                }
-                ms->buf.len = 0; /* 无协议头：丢弃脏数据 */
+            /* 扫描协议头，而不是整段丢弃（避免误丢 RESET_CONFIRM） */
+            size_t window = ms->buf.len < 65536 ? ms->buf.len : 65536;
+            long idx = -1;
+            for (size_t i = 0; i + 4 <= window; i++) {
+                if (read_le32(ms->buf.data + ms->buf.head + i) == 0xFFFFFFFFu) { idx = (long)i; break; }
             }
+            if (idx >= 0) {
+                buf_consume(&ms->buf, (size_t)idx);
+                if (ms->buf.len < 8) return; /* 等待长度字段 */
+                unsigned length = read_le32(ms->buf.data + ms->buf.head + 4);
+                if (length > 50) {
+                    buf_consume(&ms->buf, 8); /* 伪头：跳过继续扫描 */
+                    continue;
+                }
+                if (ms->buf.len < 8 + length) return; /* 协议消息未收全 */
+                char text[64];
+                memcpy(text, ms->buf.data + ms->buf.head + 8, length);
+                text[length] = '\0';
+                buf_consume(&ms->buf, 8 + length);
+                /* trim */
+                char* t = text;
+                while (*t == ' ' || *t == '\t' || *t == '\n' || *t == '\r') t++;
+                size_t n = strlen(t);
+                while (n > 0 && (t[n - 1] == ' ' || t[n - 1] == '\t' || t[n - 1] == '\n' || t[n - 1] == '\r')) n--;
+                t[n] = '\0';
+                if (strcmp(t, "RESET_CONFIRM") == 0) {
+                    ms->protocolMode = 0;
+                    buf_clear(&ms->buf);
+                    if (ms->on_sync) ms->on_sync(ms->on_sync_user);
+                }
+                continue;
+            }
+            /* 窗口内无协议头：丢弃已扫描部分，保留尾部 3 字节（可能半截头） */
+            size_t keep = ms->buf.len < 3 ? ms->buf.len : 3;
+            buf_consume(&ms->buf, ms->buf.len - keep);
             return;
         }
 
         size_t headerSize = ms->enableCRC ? 8 : 4;
         if (ms->expectedLen < 0) {
             if (ms->buf.len < headerSize) return;
-            unsigned length = read_le32(ms->buf.data);
+            unsigned length = read_le32(ms->buf.data + ms->buf.head);
             if (ms->enableCRC) {
-                unsigned expected = read_le32(ms->buf.data + 4);
-                if (ipc_crc32(ms->buf.data, 4) != expected) {
+                unsigned expected = read_le32(ms->buf.data + ms->buf.head + 4);
+                if (ipc_crc32(ms->buf.data + ms->buf.head, 4) != expected) {
                     ms_send_error(ms, IPC_ERR_LENGTH_CRC_FAILED);
                     emit_error(ms, "length header CRC check failed");
                     ms_reset(ms);
                     return;
                 }
+            }
+            /* 长度头强制校验：0 或超限视为坏帧（CRC 合法也可能是伪造/损坏的长度） */
+            if (length == 0 || (size_t)length > ms->maxBufferSize) {
+                unsigned char code = (size_t)length > ms->maxBufferSize
+                                         ? IPC_ERR_BUFFER_OVERFLOW : IPC_ERR_LENGTH_CRC_FAILED;
+                ms_send_error(ms, code);
+                char msg[64];
+                snprintf(msg, sizeof(msg), "invalid frame length %u", length);
+                emit_error(ms, msg);
+                ms_reset(ms);
+                return;
             }
             ms->expectedLen = (long)length;
             buf_consume(&ms->buf, headerSize);
@@ -199,9 +231,9 @@ static void process_buffer(MessageStream* ms) {
         size_t totalSize = (size_t)ms->expectedLen + (ms->enableCRC ? 4 : 0);
         if (ms->buf.len < totalSize) return;
         unsigned char* data = (unsigned char*)malloc((size_t)ms->expectedLen);
-        memcpy(data, ms->buf.data, (size_t)ms->expectedLen);
+        memcpy(data, ms->buf.data + ms->buf.head, (size_t)ms->expectedLen);
         if (ms->enableCRC) {
-            unsigned expected = read_le32(ms->buf.data + ms->expectedLen);
+            unsigned expected = read_le32(ms->buf.data + ms->buf.head + ms->expectedLen);
             if (ipc_crc32(data, (size_t)ms->expectedLen) != expected) {
                 free(data);
                 ms_send_error(ms, IPC_ERR_MESSAGE_CRC_FAILED);

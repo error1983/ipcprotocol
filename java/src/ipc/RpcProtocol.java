@@ -178,10 +178,13 @@ public class RpcProtocol implements Closeable {
     @SuppressWarnings("unchecked")
     public static BinaryRequest decodeBinaryRequest(byte[] buffer) {
         int offset = 0;
-        int methodLength = (int) readBe32(buffer, offset); offset += 4;
-        String method = new String(buffer, offset, methodLength, StandardCharsets.UTF_8); offset += methodLength;
-        int paramsLength = (int) readBe32(buffer, offset); offset += 4;
-        Object parsed = Json.parse(new String(buffer, offset, paramsLength, StandardCharsets.UTF_8)); offset += paramsLength;
+        if (buffer.length < 4) throw new IllegalArgumentException("binary request too short");
+        long methodLength = readBe32(buffer, offset); offset += 4;
+        if (buffer.length < offset + methodLength + 4) throw new IllegalArgumentException("binary request truncated (method)");
+        String method = new String(buffer, offset, (int) methodLength, StandardCharsets.UTF_8); offset += (int) methodLength;
+        long paramsLength = readBe32(buffer, offset); offset += 4;
+        if (buffer.length < offset + paramsLength) throw new IllegalArgumentException("binary request truncated (params)");
+        Object parsed = Json.parse(new String(buffer, offset, (int) paramsLength, StandardCharsets.UTF_8)); offset += (int) paramsLength;
         List<Object> params = parsed instanceof List ? (List<Object>) parsed : new ArrayList<>(Arrays.asList(parsed));
         byte[] binaryData = Arrays.copyOfRange(buffer, offset, buffer.length);
         return new BinaryRequest(method, params, binaryData);
@@ -204,6 +207,16 @@ public class RpcProtocol implements Closeable {
             }
         } catch (Exception err) {
             System.err.println("Failed to handle message: " + err.getMessage());
+            // 畸形 REQUEST 尽量回错误响应，避免调用方永久等待（对齐 JS 修复版）
+            if (buffer.length >= 18 && (buffer[0] & 0xFF) == TYPE_REQUEST) {
+                try {
+                    ByteBuffer bb = ByteBuffer.wrap(buffer, 2, 16);
+                    String id = new UUID(bb.getLong(), bb.getLong()).toString();
+                    Map<String, Object> error = new LinkedHashMap<>();
+                    error.put("error", "Invalid request payload");
+                    sendResponse(id, error, CONTENT_JSON);
+                } catch (Exception ignored) { }
+            }
         }
     }
 
@@ -212,30 +225,40 @@ public class RpcProtocol implements Closeable {
         String method;
         Object[] args;
 
-        if (request instanceof byte[]) {
-            BinaryRequest decoded = decodeBinaryRequest((byte[]) request);
-            method = decoded.method;
-            List<Object> list = new ArrayList<>();
-            list.add(decoded.binaryData);
-            list.addAll(decoded.params);
-            args = list.toArray();
-        } else if (request instanceof Map) {
-            Map<String, Object> map = (Map<String, Object>) request;
-            method = (String) map.get("method");
-            Object params = map.get("params");
-            if (params instanceof List) {
-                args = ((List<Object>) params).toArray();
-            } else if (params == null) {
-                args = new Object[0];
+        try {
+            if (request instanceof byte[]) {
+                BinaryRequest decoded = decodeBinaryRequest((byte[]) request);
+                method = decoded.method;
+                List<Object> list = new ArrayList<>();
+                list.add(decoded.binaryData);
+                list.addAll(decoded.params);
+                args = list.toArray();
+            } else if (request instanceof Map) {
+                Map<String, Object> map = (Map<String, Object>) request;
+                Object m = map.get("method");
+                method = m instanceof String ? (String) m : null;
+                Object params = map.get("params");
+                if (params instanceof List) {
+                    args = ((List<Object>) params).toArray();
+                } else if (params == null) {
+                    args = new Object[0];
+                } else {
+                    args = new Object[] { params };
+                }
             } else {
-                args = new Object[] { params };
+                throw new IllegalArgumentException("request payload is not an object");
             }
-        } else {
-            method = null;
-            args = new Object[0];
+            if (method == null || method.isEmpty()) {
+                throw new IllegalArgumentException("request method missing");
+            }
+        } catch (Exception err) {
+            Map<String, Object> error = new LinkedHashMap<>();
+            error.put("error", "Invalid request payload: " + err.getMessage());
+            sendResponse(id, error, CONTENT_JSON);
+            return;
         }
 
-        Handler handler = method != null ? handlers.get(method) : null;
+        Handler handler = handlers.get(method);
         if (handler == null) {
             Map<String, Object> error = new LinkedHashMap<>();
             error.put("error", "Method not found: " + method);

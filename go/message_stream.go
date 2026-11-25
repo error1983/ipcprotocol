@@ -2,6 +2,7 @@
 package ipc
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -152,25 +153,45 @@ func (ms *MessageStream) processBuffer() {
 			return
 		}
 		if ms.protocolMode {
-			if len(ms.buf) >= 8 {
-				if binary.LittleEndian.Uint32(ms.buf[0:4]) == 0xFFFFFFFF {
-					length := int(binary.LittleEndian.Uint32(ms.buf[4:8]))
-					if length <= 50 && len(ms.buf) >= 8+length {
-						text := string(ms.buf[8 : 8+length])
-						ms.buf = ms.buf[8+length:]
-						if trimSpace(text) == "RESET_CONFIRM" {
-							ms.protocolMode = false
-							ms.buf = nil
-							if ms.OnSyncComplete != nil {
-								ms.OnSyncComplete()
-							}
-						}
-						continue
-					}
+			// 扫描协议头，而不是整段丢弃（避免误丢 RESET_CONFIRM）
+			window := len(ms.buf)
+			if window > 64*1024 {
+				window = 64 * 1024
+			}
+			idx := -1
+			if window >= 4 {
+				idx = bytes.Index(ms.buf[:window], []byte{0xFF, 0xFF, 0xFF, 0xFF})
+			}
+			if idx >= 0 {
+				ms.buf = ms.buf[idx:]
+				if len(ms.buf) < 8 {
+					return // 等待长度字段
+				}
+				length := binary.LittleEndian.Uint32(ms.buf[4:8])
+				if length > 50 {
+					ms.buf = ms.buf[8:] // 伪头：跳过继续扫描
+					continue
+				}
+				if len(ms.buf) < 8+int(length) {
 					return // 协议消息未收全
 				}
-				ms.buf = nil // 无协议头：丢弃脏数据
+				text := string(ms.buf[8 : 8+int(length)])
+				ms.buf = ms.buf[8+int(length):]
+				if trimSpace(text) == "RESET_CONFIRM" {
+					ms.protocolMode = false
+					ms.buf = nil
+					if ms.OnSyncComplete != nil {
+						ms.OnSyncComplete()
+					}
+				}
+				continue
 			}
+			// 窗口内无协议头：丢弃已扫描部分，保留尾部 3 字节（可能半截头）
+			keep := len(ms.buf)
+			if keep > 3 {
+				keep = 3
+			}
+			ms.buf = ms.buf[len(ms.buf)-keep:]
 			return
 		}
 
@@ -182,7 +203,7 @@ func (ms *MessageStream) processBuffer() {
 			if len(ms.buf) < headerSize {
 				return
 			}
-			length := int(binary.LittleEndian.Uint32(ms.buf[0:4]))
+			length := binary.LittleEndian.Uint32(ms.buf[0:4])
 			if ms.EnableCRC {
 				expected := binary.LittleEndian.Uint32(ms.buf[4:8])
 				if crc32.ChecksumIEEE(ms.buf[0:4]) != expected {
@@ -192,7 +213,18 @@ func (ms *MessageStream) processBuffer() {
 					return
 				}
 			}
-			ms.expectedLen = length
+			// 长度头强制校验：0 或超限视为坏帧（CRC 合法也可能是伪造/损坏的长度）
+			if length == 0 || uint64(length) > uint64(ms.MaxBufferSize) {
+				code := byte(ErrLengthCRCFailed)
+				if uint64(length) > uint64(ms.MaxBufferSize) {
+					code = ErrBufferOverflow
+				}
+				_ = ms.SendError(code)
+				ms.emitError(fmt.Errorf("invalid frame length %d", length))
+				ms.reset()
+				return
+			}
+			ms.expectedLen = int(length)
 			ms.buf = ms.buf[headerSize:]
 		}
 

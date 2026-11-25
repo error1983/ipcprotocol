@@ -310,7 +310,10 @@ static void* request_thread(void* arg) {
         }
     }
 
-    if (method) {
+    if (!method || !method[0]) {
+        /* 畸形请求（非对象/无 method/二进制解码失败）：回错误响应而非静默丢弃 */
+        send_response(rpc, job->id, NULL, "Invalid request payload");
+    } else {
         IpcHandler fn = NULL;
         void* user = NULL;
         pthread_mutex_lock(&rpc->mu);
@@ -360,7 +363,13 @@ static void on_stream_message(void* user, const unsigned char* data, size_t len)
     char id[37];
     bytes_to_uuid(data + 2, id);
     JsonValue* content = deserialize(contentType, data + 18, len - 18);
-    if (!content) return;
+    if (!content) {
+        /* 畸形 REQUEST 尽量回错误响应，避免调用方永久等待（对齐 JS 修复版） */
+        if (msgType == TYPE_REQUEST) {
+            send_response(rpc, id, NULL, "Invalid request payload");
+        }
+        return;
+    }
 
     if (msgType == TYPE_REQUEST) {
         RequestJob* job = (RequestJob*)calloc(1, sizeof(RequestJob));

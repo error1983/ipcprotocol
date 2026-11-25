@@ -1,522 +1,432 @@
-// MessageStream.js
+// MessageStream.js  — 修复版（线格式与 PROTOCOL.md 完全一致，仅内部实现重构）
+// 帧格式(CRC 开启): [len u32LE][lenCrc u32LE][payload][payloadCrc u32LE]
+// 帧格式(CRC 关闭): [len u32LE][payload]
+// 协议模式消息:     [0xFFFFFFFF][len u32LE][utf8 data]
+// 错误包(在正常帧内): [0xEEEEEEEE][code u8]
 import { EventEmitter } from 'events';
+import zlib from 'node:zlib';
 
-// CRC32 查找表
-const CRC32_TABLE = new Uint32Array(256);
-(() => {
-    for (let i = 0; i < 256; i++) {
-        let c = i;
-        for (let j = 0; j < 8; j++) {
-            c = (c & 1) ? 0xEDB88320 ^ (c >>> 1) : c >>> 1;
-        }
-        CRC32_TABLE[i] = c;
-    }
-})();
+const PROTOCOL_HEADER = Buffer.from([0xFF, 0xFF, 0xFF, 0xFF]);
+const PROTOCOL_HEADER_U32 = 0xFFFFFFFF;
+const ERROR_HEADER_U32 = 0xEEEEEEEE;
 
-/**
- * 计算 Buffer 的 CRC32 校验值
- * @param {Buffer} buffer 
- * @returns {number} CRC32 校验值
- */
-function crc32(buffer) {
+const CHUNK = 64 * 1024;
+const MAX_PROTOCOL_MSG = 50;
+
+export const ERROR_CODES = {
+    LENGTH_CRC_FAILED: 1,
+    MESSAGE_CRC_FAILED: 2,
+    BUFFER_OVERFLOW: 3,
+};
+const ERROR_NAMES = { 1: 'LENGTH_CRC_FAILED', 2: 'MESSAGE_CRC_FAILED', 3: 'BUFFER_OVERFLOW' };
+
+// CRC32（标准多项式，与 zlib / PROTOCOL.md 一致）
+const CRC_TABLE = new Uint32Array(256);
+for (let i = 0; i < 256; i++) {
+    let c = i;
+    for (let j = 0; j < 8; j++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+    CRC_TABLE[i] = c >>> 0;
+}
+function crc32Table(buf) {
     let crc = 0xFFFFFFFF;
-    for (let i = 0; i < buffer.length; i++) {
-        const byte = buffer[i];
-        crc = CRC32_TABLE[(crc ^ byte) & 0xFF] ^ (crc >>> 8);
-    }
-    return (crc ^ 0xFFFFFFFF) >>> 0; // 确保返回无符号32位整数
+    for (let i = 0; i < buf.length; i++) crc = CRC_TABLE[(crc ^ buf[i]) & 0xFF] ^ (crc >>> 8);
+    return (crc ^ 0xFFFFFFFF) >>> 0;
+}
+const hasNativeCrc = typeof zlib.crc32 === 'function';
+export function crc32(buf) {
+    return (hasNativeCrc ? zlib.crc32(buf) : crc32Table(buf)) >>> 0;
+}
+
+function ipcError(message, code) {
+    return Object.assign(new Error(message), { code });
 }
 
 export class MessageStream extends EventEmitter {
     constructor(options) {
         if (!options || !options.socket) throw new Error('socket is undefined');
         super();
-        this.buffer = Buffer.alloc(0);
-        this.expectedLength = null;
-
-        // 模式控制
-        this.protocolMode = false; // false=正常模式, true=协议模式
-        this.protocolHeader = Buffer.from([0xFF, 0xFF, 0xFF, 0xFF]); // 协议模式标识头
-
-        // 新增：最大缓冲区大小，默认 256MB
-        this.maxBufferSize = options.maxBufferSize || 256 * 1024 * 1024; // 256MB
         this.socket = options.socket;
+        this.enableCRC = options.enableCRC !== false;
+        this.maxBufferSize = options.maxBufferSize || 256 * 1024 * 1024;
+        this.syncTimeout = options.syncTimeout ?? 3000;
 
-        this.socket.on('data', (data) => {
-            // console.log('data', data);
-            this.onData(data);
-        });
+        // 接收缓冲：Buffer 队列 + 头游标（不再整段 Buffer.concat，消除 O(n²)）
+        this._q = [];
+        this._qHead = 0;
+        this._buffered = 0;
 
-        // 新增：是否启用 CRC 校验
-        this.enableCRC = options.enableCRC !== false; // 默认启用
+        this._expectedLength = null;
+        this._protocolMode = false;
+        this._closed = false;
 
-        // 新增：发送队列
-        this.sendQueue = Promise.resolve();
-        this.abortController = new AbortController(); // Node.js 15+ 支持
+        // 发送：单一串行队列 + 背压处理
+        this._chain = Promise.resolve();
+        this._syncDeferred = null;
+        this._syncTimer = null;
 
-        // 定义错误消息标识符 (4字节)
-        this.errorHeader = Buffer.from([0xEE, 0xEE, 0xEE, 0xEE]);
-        // 定义错误类型映射
-        this.errorTypes = {
-            'LENGTH_CRC_FAILED': 1,
-            'MESSAGE_CRC_FAILED': 2,
-            'BUFFER_OVERFLOW': 3
-        };
-        // 反向映射
-        this.errorTypeCodes = {
-            1: 'LENGTH_CRC_FAILED',
-            2: 'MESSAGE_CRC_FAILED',
-            3: 'BUFFER_OVERFLOW'
+        const onData = (d) => this._onData(d);
+        const onEnd = () => this._failClosed('IPC stream ended');
+        const onClose = () => this._failClosed('IPC stream closed');
+        const onError = (err) => this._emitError(ipcError(`socket error: ${err?.message || err}`, 'ESOCKET'));
+
+        this.socket.on('data', onData);
+        this.socket.on('end', onEnd);
+        this.socket.on('close', onClose);
+        this.socket.on('error', onError);
+        this._detach = () => {
+            this.socket?.off('data', onData);
+            this.socket?.off('end', onEnd);
+            this.socket?.off('close', onClose);
+            this.socket?.off('error', onError);
         };
     }
 
-    // 测试方法：模拟 CRC 错误
-    async simulateCRCErrors() {
-        console.log('[Test] Simulating CRC errors');
-        // 发送一个错误消息来测试处理流程
-        await this.sendError('TEST_ERROR');
-        this.reset();
-        // 等待一段时间观察行为
-        await new Promise(resolve => setTimeout(resolve, 1000));
-        console.log('[Test] CRC error simulation complete');
-    }
+    // ===== 只读状态（兼容旧代码 + 测试） =====
+    get protocolMode() { return this._protocolMode; }
+    get expectedLength() { return this._expectedLength; }
+    get buffered() { return this._buffered; }
+    get buffer() { return { length: this._buffered }; }
 
-    // 获取当前状态用于调试
     getStatus() {
         return {
-            bufferLength: this.buffer?.length || 0,
-            expectedLength: this.expectedLength,
-            sendQueuePending: this.sendQueue !== Promise.resolve(),
+            buffered: this._buffered,
+            expectedLength: this._expectedLength,
+            protocolMode: this._protocolMode,
+            closed: this._closed,
+            enableCRC: this.enableCRC,
             socketReadyState: this.socket?.readyState,
-            enableCRC: this.enableCRC
         };
     }
 
-    // 重置方法
-    reset() {
-        console.log('[MessageStream] Resetting stream state');
-        this.buffer = Buffer.alloc(0);
-        this.expectedLength = null;
-        this.protocolMode = true; // 进入协议模式
-
-        // 取消所有正在进行的操作
-        this.abortController.abort();
-        this.abortController = new AbortController();
-
-        // 创建新的队列
-        this.sendQueue = Promise.resolve();
-
-        console.log('[MessageStream] Stream state reset complete');
+    _emitError(err) {
+        if (this.listenerCount('error') > 0) this.emit('error', err);
+        else console.error('[MessageStream] unhandled error:', err?.code || '', err?.message || err);
     }
 
-    // 处理协议消息
-    handleProtocolMessage(messageData) {
-        if (messageData.length > 50) return false;
+    _failClosed(reason) {
+        if (this._closed) return;
+        this._closed = true;
+        if (this._syncDeferred) { try { this._syncDeferred.reject(ipcError(reason, 'ECLOSED')); } catch { } this._syncDeferred = null; }
+        this._clearSyncTimer();
+        this._emitError(ipcError(reason, 'ECLOSED'));
+    }
 
-        const messageString = messageData.toString('utf8').trim();
+    // ===== 接收缓冲工具 =====
+    _append(data) {
+        this._q.push(data);
+        this._buffered += data.length;
+    }
 
-        switch (messageString) {
-            case 'RESET_CONFIRM':
-                console.log('Received reset confirmation');
-                this.protocolMode = false; // 切换回正常模式
-                // 安全起见，清空缓冲区并重置状态
-                this.buffer = Buffer.alloc(0);
-                this.expectedLength = null;
-                this.emit('syncComplete');
-                return true;
+    _copyRange(offset, len) {
+        const out = Buffer.allocUnsafe(len);
+        let qi = 0, pos = this._qHead, skip = offset;
+        while (skip > 0) {
+            const c = this._q[qi];
+            const avail = c.length - pos;
+            if (skip >= avail) { skip -= avail; qi++; pos = 0; } else { pos += skip; skip = 0; }
         }
-        return false;
+        let filled = 0;
+        while (filled < len) {
+            const c = this._q[qi];
+            const avail = c.length - pos;
+            const take = Math.min(avail, len - filled);
+            c.copy(out, filled, pos, pos + take);
+            filled += take; pos += take;
+            if (pos >= c.length) { qi++; pos = 0; }
+        }
+        return out;
     }
 
-    // 发送错误消息 - 使用二进制格式
-    async sendError(errorType) {
-        // 错误消息格式: [错误标识头(4字节)][错误类型(1字节)]
-        const errorTypeCode = this.errorTypes[errorType] || 0;
-        const errorTypeBuffer = Buffer.alloc(1);
-        errorTypeBuffer.writeUInt8(errorTypeCode, 0);
+    _readU32(offset) { return this._copyRange(offset, 4).readUInt32LE(0); }
 
-        const errorData = Buffer.concat([this.errorHeader, errorTypeBuffer]);
+    _consume(n) {
+        let left = n;
+        while (left > 0) {
+            const c = this._q[0];
+            const avail = c.length - this._qHead;
+            if (left >= avail) { left -= avail; this._q.shift(); this._qHead = 0; }
+            else { this._qHead += left; left = 0; }
+        }
+        this._buffered -= n;
+    }
 
+    /** 取出 n 字节并消费；单块内零拷贝 */
+    _take(n) {
+        if (n === 0) return Buffer.alloc(0);
+        const c = this._q[0];
+        if (c.length - this._qHead >= n) {
+            const out = c.subarray(this._qHead, this._qHead + n);
+            this._qHead += n;
+            this._buffered -= n;
+            if (this._qHead === c.length) { this._q.shift(); this._qHead = 0; }
+            return out;
+        }
+        const out = this._copyRange(0, n);
+        this._consume(n);
+        return out;
+    }
+
+    _clearBuffer() {
+        this._q = [];
+        this._qHead = 0;
+        this._buffered = 0;
+    }
+
+    _findHeader() {
+        const window = Math.min(this._buffered, 64 * 1024);
+        if (window < 4) return -1;
+        return this._copyRange(0, window).indexOf(PROTOCOL_HEADER);
+    }
+
+    // ===== 接收主循环 =====
+    _onData(data) {
+        if (this._closed) return;
+        this._append(data);
+        if (this._buffered > this.maxBufferSize + 16) {
+            this._sendError(ERROR_CODES.BUFFER_OVERFLOW).catch(() => { });
+            this._emitError(ipcError(`buffer ${this._buffered} exceeds limit`, 'BUFFER_OVERFLOW'));
+            this._enterProtocolMode();
+            return;
+        }
         try {
-            // 使用正常的消息发送方式发送错误信息
-            await this._sendInternal(this.socket, errorData, 128);
+            this._process();
         } catch (err) {
-            console.error('Failed to send error packet:', err);
+            this._emitError(ipcError(`process error: ${err.message}`, 'EPARSE'));
         }
     }
 
-    // 发送协议消息（带协议头标识）
-    async sendProtocolMessage(message) {
-        const messageData = Buffer.from(message);
-        const lengthHeader = Buffer.alloc(4);
-        lengthHeader.writeUInt32LE(messageData.length, 0);
+    _process() {
+        while (true) {
+            if (this._protocolMode) {
+                if (this._buffered < 8) return;
+                if (this._readU32(0) !== PROTOCOL_HEADER_U32) {
+                    const idx = this._findHeader();
+                    if (idx < 0) {
+                        const drop = Math.max(0, this._buffered - 3);
+                        if (drop > 0) this._consume(drop);
+                        return;
+                    }
+                    this._consume(idx);
+                    continue;
+                }
+                const len = this._readU32(4);
+                if (len > MAX_PROTOCOL_MSG || len > this.maxBufferSize) { this._consume(8); continue; }
+                if (this._buffered < 8 + len) return;
+                this._consume(8);
+                const text = this._take(len).toString('utf8').trim();
+                this._handleProtocolMessage(text);
+                continue;
+            }
 
-        // 协议消息格式: [协议标识头][长度头][数据]
-        const protocolMessage = Buffer.concat([
-            this.protocolHeader,
-            lengthHeader,
-            messageData
-        ]);
+            if (this._expectedLength === null) {
+                const hdr = this.enableCRC ? 8 : 4;
+                if (this._buffered < hdr) return;
+                const length = this._readU32(0);
 
-        try {
-            await this._sendDirect(protocolMessage, 128);
-        } catch (err) {
-            console.error(`Failed to send protocol message '${message}':`, err);
-        }
-    }
-
-    // 添加一个直接发送方法，绕过所有检查
-    async _sendDirect(data, chunkSize = 128) {
-        if (!this.socket ||
-            (this.socket.readyState !== 'open' && this.socket.writable !== true)) {
-            throw new Error('Stream is not connected');
-        }
-
-        // 如果支持 cork/uncork，使用它来确保原子性
-        this.socket.cork();
-        try {
-            return await this._sendDirectInternal(this.socket, data, chunkSize);
-        } finally {
-            this.socket.uncork();
-        }
-    }
-
-    async _sendDirectInternal(stream, data, chunkSize = 128) {
-        return new Promise((resolve, reject) => {
-            let offset = 0;
-            const totalLength = data.length;
-
-            const sendNextChunk = () => {
-                if (offset >= totalLength) {
-                    resolve();
+                // ★ 关键修复：长度必须校验，否则一条假帧会让链路静默等 4GB
+                if (length === 0 || length > this.maxBufferSize) {
+                    this._sendError(length > this.maxBufferSize ? ERROR_CODES.BUFFER_OVERFLOW : ERROR_CODES.LENGTH_CRC_FAILED).catch(() => { });
+                    this._emitError(ipcError(`invalid frame length ${length}`, 'BAD_LENGTH'));
+                    this._enterProtocolMode();
                     return;
                 }
 
-                const remaining = totalLength - offset;
-                const size = Math.min(chunkSize, remaining);
-                const chunk = data.subarray(offset, offset + size);
-
-                if (stream.write(chunk)) {
-                    offset += size;
-                    setImmediate(sendNextChunk);
-                } else {
-                    stream.once('drain', () => {
-                        offset += size;
-                        sendNextChunk();
-                    });
+                if (this.enableCRC) {
+                    const expected = this._readU32(4);
+                    const lenBuf = Buffer.allocUnsafe(4);
+                    lenBuf.writeUInt32LE(length, 0);
+                    if (crc32(lenBuf) !== expected) {
+                        this._sendError(ERROR_CODES.LENGTH_CRC_FAILED).catch(() => { });
+                        this._emitError(ipcError('length header CRC check failed', 'LENGTH_CRC_FAILED'));
+                        this._enterProtocolMode();
+                        return;
+                    }
                 }
-            };
 
-            sendNextChunk();
-        });
-    }
-
-    /**
-     * 实例方法：发送数据，包含 CRC 校验和队列管理
-     * 发送数据，包含 CRC 校验
-     * 格式: [长度头(4字节)][长度头CRC(可选4字节)][数据...][数据CRC(可选4字节)]
-     * @param {Buffer} data 要发送的数据
-     * @param {number} [chunkSize=65536] 分片大小，默认 64KB
-     */
-    send(data, chunkSize = 65536) {
-        if (data.length > this.maxBufferSize) {
-            return Promise.reject(new Error('Data size exceeds maximum allowed limit'));
-        }
-
-        const signal = this.abortController.signal;
-
-        return new Promise((resolve, reject) => {
-            // 监听取消信号
-            if (signal.aborted) {
-                reject(new Error('Send operation cancelled'));
-                return;
+                this._expectedLength = length;
+                this._consume(hdr);
             }
 
-            const abortHandler = () => {
-                signal.removeEventListener('abort', abortHandler);
-                reject(new Error('Send operation cancelled'));
-            };
-            signal.addEventListener('abort', abortHandler);
+            const total = this._expectedLength + (this.enableCRC ? 4 : 0);
+            if (this._buffered < total) return;
 
-            this.sendQueue = this.sendQueue.then(async () => {
-                try {
-                    // 再次检查是否已被取消
-                    if (signal.aborted) {
-                        throw new Error('Send operation cancelled');
-                    }
+            const payload = this._take(this._expectedLength);
 
-                    if (!this.socket ||
-                        (this.socket.readyState !== 'open' && this.socket.writable !== true)) {
-                        throw new Error('Stream is not connected');
-                    }
-                    await this._sendInternal(this.socket, data, chunkSize);
-                    resolve();
-                } catch (error) {
-                    reject(error);
-                } finally {
-                    signal.removeEventListener('abort', abortHandler);
+            if (this.enableCRC) {
+                const expected = this._readU32(0);
+                this._consume(4);
+                if (crc32(payload) !== expected) {
+                    this._expectedLength = null;
+                    this._sendError(ERROR_CODES.MESSAGE_CRC_FAILED).catch(() => { });
+                    this._emitError(ipcError('message CRC check failed', 'MESSAGE_CRC_FAILED'));
+                    this._enterProtocolMode();
+                    return;
                 }
-            }).catch(error => {
-                signal.removeEventListener('abort', abortHandler);
-                reject(error);
-            });
-        });
-    }
+            }
+            this._expectedLength = null;
 
-    // 内部发送实现
-    async _sendInternal(stream, data, chunkSize = 65536) {
-        if (!stream || (stream.readyState !== 'open' && stream.writable !== true)) {
-            throw new Error('Stream is not connected');
-        }
-
-        const totalLength = data.length;
-        const enableCRC = this.enableCRC;
-
-        // 使用 cork/uncork 确保消息原子性发送
-        stream.cork();
-        try {
-            await this._sendData(stream, data, totalLength, chunkSize, enableCRC);
-        } finally {
-            stream.uncork();
+            if (this._isErrorPacket(payload)) {
+                this._onPeerError(payload[4]);
+                continue;
+            }
+            this.emit('message', payload);
         }
     }
 
-    // 发送数据核心逻辑（使用 cork）
-    async _sendData(stream, data, totalLength, chunkSize, enableCRC) {
-        // 构造并发送长度头
-        const lengthHeader = Buffer.alloc(4);
-        lengthHeader.writeUInt32LE(totalLength, 0);
-        stream.write(lengthHeader);
+    _isErrorPacket(buf) {
+        return buf.length === 5 && buf.readUInt32LE(0) === ERROR_HEADER_U32;
+    }
 
-        // 如果启用 CRC，发送长度头的 CRC
-        if (enableCRC) {
-            const lengthCRC = crc32(lengthHeader);
-            const lengthCRCBuffer = Buffer.alloc(4);
-            lengthCRCBuffer.writeUInt32LE(lengthCRC, 0);
-            stream.write(lengthCRCBuffer);
-        }
+    // ===== 错误 / 重同步 =====
+    _enterProtocolMode() {
+        this._clearBuffer();
+        this._expectedLength = null;
+        this._protocolMode = true;
 
-        // 发送数据块
-        let offset = 0;
-        while (offset < totalLength) {
-            const remaining = totalLength - offset;
-            const size = Math.min(chunkSize, remaining);
-            const chunk = data.subarray(offset, offset + size);
-            stream.write(chunk);
-            offset += size;
-        }
+        this._clearSyncTimer();
+        let resolveFn, rejectFn;
+        const promise = new Promise((res, rej) => { resolveFn = res; rejectFn = rej; });
+        promise.catch(() => { });  // 防止未处理 rejection
+        this._syncDeferred = { promise, resolve: resolveFn, reject: rejectFn };
 
-        // 如果启用 CRC，发送数据的 CRC
-        if (enableCRC) {
-            const dataCRC = crc32(data);
-            const dataCRCBuffer = Buffer.alloc(4);
-            dataCRCBuffer.writeUInt32LE(dataCRC, 0);
-            stream.write(dataCRCBuffer);
+        // 防御：重同步握手失败不再无限等待，直接断链让上层重连
+        this._syncTimer = setTimeout(() => {
+            if (!this._protocolMode) return;
+            this._emitError(ipcError('resync handshake timeout', 'ERESYNC_TIMEOUT'));
+            this._protocolMode = false;
+            this._resolveSync();
+            try { this.socket?.destroy(); } catch { }
+        }, this.syncTimeout);
+        this._syncTimer.unref?.();
+    }
+
+    _clearSyncTimer() {
+        if (this._syncTimer) { clearTimeout(this._syncTimer); this._syncTimer = null; }
+    }
+
+    _resolveSync() {
+        this._clearSyncTimer();
+        if (this._syncDeferred) { try { this._syncDeferred.resolve(); } catch { } this._syncDeferred = null; }
+    }
+
+    _handleProtocolMessage(text) {
+        if (text === 'RESET_CONFIRM') {
+            this._protocolMode = false;
+            this._expectedLength = null;
+            this._resolveSync();
+            this.emit('syncComplete');
         }
     }
 
-    // 修改 onData 方法
-    onData(data) {
-        this.buffer = Buffer.concat([this.buffer, data]);
+    /** 收到对端的损坏报告 */
+    _onPeerError(code) {
+        this._emitError(ipcError(`peer reported ${ERROR_NAMES[code] || code}`, 'ERESYNC'));
+        this._enterProtocolMode();
+        this._sendProtocolMessage('RESET_CONFIRM').catch(() => { });
+        this._protocolMode = false;
+        this._resolveSync();
+    }
 
-        if (this.buffer.length > this.maxBufferSize) {
-            this.emit('error', `Buffer size: ${this.buffer.length} exceeds maximum allowed limit`);
-            this.sendError('BUFFER_OVERFLOW').catch(() => { });
-            this.reset();
+    // ===== 发送 =====
+    send(data) {
+        if (!Buffer.isBuffer(data)) data = Buffer.from(data);
+        if (data.length > this.maxBufferSize) {
+            return Promise.reject(ipcError('data exceeds maxBufferSize', 'ETOOBIG'));
+        }
+        return this._enqueue(() => this._writeFrame(data));
+    }
+
+    _enqueue(fn) {
+        const p = this._chain.then(fn);
+        this._chain = p.then(() => { }, () => { });   // 队列永不因单次失败而断链
+        return p;
+    }
+
+    async _syncGate() {
+        if (!this._protocolMode) return;
+        if (!this._syncDeferred) throw ipcError('stream is resyncing', 'ERESYNC');
+        await this._syncDeferred.promise;   // 超时会被 reject
+    }
+
+    async _writeFrame(data, bypassGate = false) {
+        if (this._closed) throw ipcError('stream closed', 'ECLOSED');
+        if (!bypassGate) await this._syncGate();
+
+        const head = Buffer.allocUnsafe(this.enableCRC ? 8 : 4);
+        head.writeUInt32LE(data.length, 0);
+        if (this.enableCRC) head.writeUInt32LE(crc32(head.subarray(0, 4)), 4);
+
+        await this._writeBuf(head);
+        await this._writeBuf(data);
+
+        if (this.enableCRC) {
+            const tail = Buffer.allocUnsafe(4);
+            tail.writeUInt32LE(crc32(data), 0);
+            await this._writeBuf(tail);
+        }
+    }
+
+    async _writeBuf(buf) {
+        if (this._closed || !this.socket || this.socket.destroyed) throw ipcError('stream not writable', 'ECLOSED');
+        if (buf.length <= CHUNK) {
+            if (!this.socket.write(buf)) await this._drain();
             return;
         }
-
-        while (this.buffer.length > 0) {
-            // 只有在协议模式下才检查协议消息
-            if (this.protocolMode && this.buffer.length >= 8) {
-                // 检查是否有协议标识头
-                if (this.buffer.readUInt32LE(0) === this.protocolHeader.readUInt32LE(0)) {
-                    // 有协议标识头，处理协议消息
-                    const length = this.buffer.readUInt32LE(4);
-                    const messageTotalSize = 8 + length;
-
-                    if (this.buffer.length >= messageTotalSize) {
-                        const messageData = Buffer.from(this.buffer.subarray(8, 8 + length));
-                        this.buffer = Buffer.from(this.buffer.subarray(messageTotalSize));
-
-                        if (this.handleProtocolMessage(messageData)) {
-                            continue; // 继续处理剩余数据
-                        }
-                    } else {
-                        break; // 等待更多数据
-                    }
-                } else {
-                    // 在协议模式下但没有协议头，可能是残留数据，丢弃
-                    console.log('[MessageStream] Dropping non-protocol data in protocol mode');
-                    this.buffer = Buffer.alloc(0);
-                    break;
-                }
-            }
-
-            // 如果在协议模式下，不处理正常消息
-            if (this.protocolMode) {
-                // 等待协议同步完成
-                break;
-            }
-
-            // 正常模式处理
-            if (this.expectedLength === null) {
-                const headerSize = this.enableCRC ? 8 : 4;
-
-                if (this.buffer.length < headerSize) {
-                    break;
-                }
-
-                const length = this.buffer.readUInt32LE(0);
-
-                if (this.enableCRC) {
-                    const expectedCRC = this.buffer.readUInt32LE(4);
-                    const lengthBuffer = Buffer.alloc(4);
-                    lengthBuffer.writeUInt32LE(length, 0);
-                    const calculatedCRC = crc32(lengthBuffer);
-
-                    if (calculatedCRC !== expectedCRC) {
-                        console.error(`Length header CRC check failed: expected ${expectedCRC}, got ${calculatedCRC}`);
-                        this.sendError('LENGTH_CRC_FAILED').catch(() => { });
-                        this.emit('error', new Error('Length header CRC check failed'));
-                        this.reset();
-                        return;
-                    }
-                }
-
-                this.expectedLength = length;
-                this.buffer = Buffer.from(this.buffer.subarray(headerSize));
-            }
-
-            const messageTotalSize = this.enableCRC ? this.expectedLength + 4 : this.expectedLength;
-
-            if (this.buffer.length >= messageTotalSize) {
-                const messageData = Buffer.from(this.buffer.subarray(0, this.expectedLength));
-
-                if (this.enableCRC) {
-                    const messageCRC = this.buffer.readUInt32LE(this.expectedLength);
-                    const calculatedCRC = crc32(messageData);
-
-                    if (calculatedCRC !== messageCRC) {
-                        console.error(`Message CRC check failed: expected ${messageCRC}, got ${calculatedCRC}`);
-                        this.sendError('MESSAGE_CRC_FAILED').catch(() => { });
-                        this.emit('error', new Error('Message CRC check failed'));
-                        this.reset();
-                        return;
-                    }
-                }
-
-                this.buffer = Buffer.from(this.buffer.subarray(messageTotalSize));
-                this.expectedLength = null;
-
-                // 检查是否是错误消息（在发送给上层之前）
-                if (this.isErrorPacket(messageData)) {
-                    const errorTypeCode = messageData.readUInt8(4);
-                    const errorTypeName = this.getErrorTypeName(errorTypeCode);
-
-                    console.log('Received error packet:', errorTypeName);
-
-                    // 收到错误消息时进入协议模式
-                    this.reset();
-
-                    // 发送确认消息，表示已准备好同步
-                    this.sendProtocolMessage('RESET_CONFIRM').catch(err => {
-                        console.error('Failed to send reset confirm:', err);
-                    });
-
-                    this.protocolMode = false;
-
-                    // 不发送给上层应用，直接处理下一个消息
-                    continue;
-                }
-
-                this.emit('message', messageData);
-            } else {
-                break;
-            }
+        for (let off = 0; off < buf.length; off += CHUNK) {
+            const chunk = buf.subarray(off, Math.min(off + CHUNK, buf.length));
+            if (!this.socket.write(chunk)) await this._drain();
         }
     }
 
-    // 检查是否是错误消息包
-    isErrorPacket(data) {
-        // 错误消息应该是5字节长，前4字节是错误标识符
-        if (data.length === 5 && data.readUInt32LE(0) === 0xEEEEEEEE) {
-            return true;
-        }
-        return false;
+    _drain() {
+        if (!this.socket || this.socket.destroyed) return Promise.reject(ipcError('stream closed', 'ECLOSED'));
+        return new Promise((resolve, reject) => {
+            const done = () => { cleanup(); resolve(); };
+            const fail = (e) => { cleanup(); reject(e instanceof Error ? e : ipcError('write failed', 'ECLOSED')); };
+            const onClose = () => fail(ipcError('stream closed during write', 'ECLOSED'));
+            const cleanup = () => {
+                this.socket.off('drain', done);
+                this.socket.off('close', onClose);
+                this.socket.off('error', fail);
+            };
+            this.socket.once('drain', done);
+            this.socket.once('close', onClose);
+            this.socket.once('error', fail);
+        });
     }
 
-    // 根据错误类型代码获取错误类型名称
-    getErrorTypeName(errorTypeCode) {
-        return this.errorTypeCodes[errorTypeCode] || 'UNKNOWN_ERROR';
+    async _sendError(code) {
+        const body = Buffer.from([0xEE, 0xEE, 0xEE, 0xEE, code]);
+        return this._enqueue(() => this._writeFrame(body, true));
     }
 
-    /**
-     * 销毁 MessageStream，清理所有资源
-     */
+    async _sendProtocolMessage(message) {
+        const payload = Buffer.from(message, 'utf8');
+        const len = Buffer.allocUnsafe(4);
+        len.writeUInt32LE(payload.length, 0);
+        const raw = Buffer.concat([PROTOCOL_HEADER, len, payload]);
+        return this._enqueue(async () => {
+            if (this._closed || this.socket?.destroyed) throw ipcError('stream closed', 'ECLOSED');
+            if (!this.socket.write(raw)) await this._drain();
+        });
+    }
+
+    // 兼容旧 API
+    async sendProtocolMessage(m) { return this._sendProtocolMessage(m); }
+    async sendError(name) { return this._sendError(ERROR_CODES[name] || 0); }
+
+    reset() { this._enterProtocolMode(); }
+
     destroy() {
-        // 清理缓冲区
-        this.buffer = null;
-        this.expectedLength = null;
-
-        // 清理 socket 监听器
-        if (this.socket) {
-            this.socket.removeAllListeners('data');
-            this.socket.end('EOF');
-            this.socket.destroy();
-            this.socket = null;
-        }
-
-        // 清理所有事件监听器
+        if (this._closed) return;
+        this._closed = true;
+        if (this._syncDeferred) { try { this._syncDeferred.reject(ipcError('destroyed', 'ECLOSED')); } catch { } this._syncDeferred = null; }
+        this._clearSyncTimer();
+        this._clearBuffer();
+        this._expectedLength = null;
+        try { this._detach?.(); } catch { }
+        try { this.socket?.destroy(); } catch { }   // 不再写入 'EOF' 垃圾字节
+        this.socket = null;
         this.removeAllListeners();
-
-        // 清理发送队列
-        this.sendQueue = null;
-
-        console.log('[MessageStream] Destroyed');
     }
-}
-
-// 保持原有的 hexdump 函数不变
-function hexdump(buffer, options = {}) {
-    const {
-        bytesPerLine = 16,
-        showAscii = true,
-        showOffset = true
-    } = options;
-
-    const bufferLength = buffer.length;
-    let output = '';
-
-    for (let i = 0; i < bufferLength; i += bytesPerLine) {
-        let hexLine = '';
-        let asciiLine = '';
-
-        // 生成十六进制部分
-        for (let j = 0; j < bytesPerLine; j++) {
-            const index = i + j;
-            if (index < bufferLength) {
-                const byte = buffer[index];
-                hexLine += byte.toString(16).padStart(2, '0') + ' ';
-                asciiLine += (byte >= 32 && byte < 127) ? String.fromCharCode(byte) : '.';
-            } else {
-                hexLine += '   ';
-                asciiLine += ' ';
-            }
-        }
-
-        // 添加偏移量
-        if (showOffset) {
-            output += i.toString(16).padStart(8, '0') + '  ';
-        }
-
-        // 添加十六进制和 ASCII 部分
-        output += hexLine;
-        if (showAscii) {
-            output += ' |' + asciiLine + '|';
-        }
-        output += '\n';
-    }
-
-    return output;
 }

@@ -30,10 +30,10 @@ const socket = net.connect(port, '127.0.0.1', async () => {
         check('null response', await rpc.sendRequest('nothing') === null);
 
         try { await rpc.sendRequest('fail'); check('error response', false); }
-        catch (err) { check('error response', String(err.error ?? err) === 'boom'); }
+        catch (err) { check('error response', String(err.data ?? err.error ?? err) === 'boom'); }
 
         try { await rpc.sendRequest('nope'); check('method not found', false); }
-        catch (err) { check('method not found', String(err.error ?? err).includes('Method not found: nope')); }
+        catch (err) { check('method not found', String(err.data ?? err.error ?? err).includes('Method not found: nope')); }
 
         const payload = Buffer.alloc(256 * 300);
         for (let i = 0; i < payload.length; i++) payload[i] = i & 0xFF;

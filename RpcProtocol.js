@@ -1,8 +1,22 @@
-// modules/ipc/RpcProtocol.js
+// modules/ipc/RpcProtocol.js — 修复版（线格式不变）
+// payload 内部结构: type(1) | contentType(1) | uuid(16 raw) | business payload
 import { v4 as uuidv4 } from 'uuid';
 import { EventEmitter } from 'events';
 
 export { uuidv4 }
+
+const DEFAULT_TIMEOUT = 15000;
+
+export class RpcError extends Error {
+    constructor(message, { code = 'RPC_ERROR', remote = false, data = undefined } = {}) {
+        super(message);
+        this.name = 'RpcError';
+        this.code = code;
+        this.remote = remote;
+        this.data = data;
+    }
+}
+
 export class RpcProtocol extends EventEmitter {
     constructor(messageStream) {
         if (!messageStream) throw new Error('messageStream is undefined');
@@ -10,368 +24,280 @@ export class RpcProtocol extends EventEmitter {
         this.messageStream = messageStream;
         this.handlers = {};
         this.pendingRequests = new Map();
+        this._destroyed = false;
 
-        this.messageStream.on('message', (buffer) => {
-            this.handleMessage(buffer);
-        });
-        this.messageStream.on('error', (error) => {
-            // console.error('[RpcProtocol] Error:', error);
-            // 当消息流出错时，通知所有等待的请求
+        this._onMessage = (buffer) => this.handleMessage(buffer);
+        this._onStreamError = (error) => {
             this.handleStreamError(error);
-            this.emit('error', error);
-        });
+            this._safeEmit('error', error);
+        };
+        this._onSync = () => this.emit('syncComplete');   // 信息类事件，无监听器不报错
+
+        this.messageStream.on('message', this._onMessage);
+        this.messageStream.on('error', this._onStreamError);
+        this.messageStream.on('syncComplete', this._onSync);
     }
 
-    // 处理消息流错误
-    handleStreamError(error) {
-        // 拒绝所有待处理的请求
-        if (this.pendingRequests) {
-            const errorMessage = error.message || 'Connection error';
-            for (const [id, pending] of this.pendingRequests) {
-                try {
-                    pending.reject(new Error(`Request failed: ${errorMessage}`));
-                } catch (err) {
-                    console.error('[RpcProtocol] Error rejecting pending request:', err);
-                }
-            }
-            this.pendingRequests.clear();
-        }
-
-        // 可以选择性地通知事件监听器连接已断开
-        // this.emit('disconnected', error);
+    _safeEmit(event, payload) {
+        if (this.listenerCount(event) > 0) this.emit(event, payload);
+        else console.error(`[RpcProtocol] unhandled '${event}':`, payload?.code || payload?.message || payload);
     }
 
     // ========== 协议定义 ==========
-    static TYPES = {
-        REQUEST: 0,
-        RESPONSE: 1,
-        EVENT: 2,
-    };
+    static TYPES = { REQUEST: 0, RESPONSE: 1, EVENT: 2 };
+    static CONTENT_TYPES = { TEXT: 0, JSON: 1, BINARY: 2 };
 
-    static CONTENT_TYPES = {
-        TEXT: 0,
-        JSON: 1,
-        BINARY: 2,
-    };
-
-    // ========== 工具方法 ==========
     static serialize(type, contentType, id, data) {
-        const header = Buffer.alloc(1 + 1 + 16); // type(1) + contentType(1) + id(16)
+        const header = Buffer.alloc(1 + 1 + 16);
         header.writeUInt8(type, 0);
         header.writeUInt8(contentType, 1);
         const idBuffer = Buffer.from(id.replace(/-/g, ''), 'hex');
         idBuffer.copy(header, 2);
 
         let payload;
-        if (contentType === RpcProtocol.CONTENT_TYPES.TEXT) {
-            payload = Buffer.from(data, 'utf8');
-        } else if (contentType === RpcProtocol.CONTENT_TYPES.JSON) {
-            payload = Buffer.from(JSON.stringify(data), 'utf8');
-        } else if (contentType === RpcProtocol.CONTENT_TYPES.BINARY) {
-            payload = data; // data is already a Buffer
-        } else {
-            throw new Error(`Unsupported content type: ${contentType}`);
-        }
+        if (contentType === RpcProtocol.CONTENT_TYPES.TEXT) payload = Buffer.from(data, 'utf8');
+        else if (contentType === RpcProtocol.CONTENT_TYPES.JSON) payload = Buffer.from(JSON.stringify(data), 'utf8');
+        else if (contentType === RpcProtocol.CONTENT_TYPES.BINARY) payload = Buffer.from(data);
+        else throw new Error(`Unsupported content type: ${contentType}`);
 
         return Buffer.concat([header, payload]);
     }
 
     static deserialize(buffer) {
-        try {
-            const type = buffer.readUInt8(0);
-            const contentType = buffer.readUInt8(1);
-            const idBuffer = buffer.slice(2, 18);
-            const id = idBuffer.toString('hex').replace(/(.{8})(.{4})(.{4})(.{4})(.*)/, '$1-$2-$3-$4-$5');
-
-            const payload = buffer.slice(18);
-            let content;
-            if (contentType === RpcProtocol.CONTENT_TYPES.TEXT) {
-                content = payload.toString('utf8');
-            } else if (contentType === RpcProtocol.CONTENT_TYPES.JSON) {
-                content = JSON.parse(payload.toString('utf8')); // 可能抛出异常
-            } else if (contentType === RpcProtocol.CONTENT_TYPES.BINARY) {
-                content = payload;
-            }
-
-            return { type, contentType, id, content };
-        } catch (error) {
-            // 处理反序列化错误
-            throw new Error(`Failed to deserialize message: ${error.message}`);
+        if (!Buffer.isBuffer(buffer) || buffer.length < 18) {
+            throw new RpcError(`message too short (${buffer?.length})`, { code: 'EMALFORMED' });
         }
+        const type = buffer.readUInt8(0);
+        const contentType = buffer.readUInt8(1);
+        // ★ 不再用正则格式化 uuid：直接按 8-4-4-4-12 切分，长度固定可控
+        const hex = buffer.subarray(2, 18).toString('hex');
+        const id = `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+
+        const payload = buffer.subarray(18);
+        let content;
+        if (contentType === RpcProtocol.CONTENT_TYPES.TEXT) content = payload.toString('utf8');
+        else if (contentType === RpcProtocol.CONTENT_TYPES.JSON) content = JSON.parse(payload.toString('utf8'));
+        else if (contentType === RpcProtocol.CONTENT_TYPES.BINARY) content = payload;
+        else throw new RpcError(`invalid contentType ${contentType}`, { code: 'EMALFORMED' });
+
+        return { type, contentType, id, content };
     }
 
-    /**
-     * 将请求数据编码为二进制格式
-     * 格式: [methodLength][method][paramsLength][params][binaryData]
-     * @param {string} method - 方法名
-     * @param {Array} params - 参数数组（除了二进制数据外的其他参数）
-     * @param {Buffer|Uint8Array} binaryData - 二进制数据
-     * @returns {Buffer} 编码后的数据
-     */
     static encodeBinaryRequest(method, params, binaryData) {
         const methodBuffer = Buffer.from(method, 'utf8');
         const methodLength = methodBuffer.length;
-
         const paramsJson = JSON.stringify(params);
         const paramsBuffer = Buffer.from(paramsJson, 'utf8');
         const paramsLength = paramsBuffer.length;
 
-        // 创建完整的二进制请求
         const totalLength = 4 + methodLength + 4 + paramsLength + binaryData.length;
         const result = Buffer.alloc(totalLength);
-
         let offset = 0;
-
-        // 写入方法名长度和方法名
-        result.writeUInt32BE(methodLength, offset);
-        offset += 4;
-        methodBuffer.copy(result, offset);
-        offset += methodLength;
-
-        // 写入参数长度和参数
-        result.writeUInt32BE(paramsLength, offset);
-        offset += 4;
-        paramsBuffer.copy(result, offset);
-        offset += paramsLength;
-
-        // 写入二进制数据
+        result.writeUInt32BE(methodLength, offset); offset += 4;
+        methodBuffer.copy(result, offset); offset += methodLength;
+        result.writeUInt32BE(paramsLength, offset); offset += 4;
+        paramsBuffer.copy(result, offset); offset += paramsLength;
         Buffer.from(binaryData).copy(result, offset);
-
         return result;
     }
 
-    /**
-     * 从二进制数据解码请求
-     * @param {Buffer} buffer - 二进制数据
-     * @returns {Object} 解码后的请求对象
-     */
     static decodeBinaryRequest(buffer) {
         let offset = 0;
-
-        // 读取方法名长度
-        const methodLength = buffer.readUInt32BE(offset);
-        offset += 4;
-
-        // 读取方法名
-        const method = buffer.toString('utf8', offset, offset + methodLength);
-        offset += methodLength;
-
-        // 读取参数长度
-        const paramsLength = buffer.readUInt32BE(offset);
-        offset += 4;
-
-        // 读取参数
+        if (buffer.length < 8) throw new RpcError('binary request too short', { code: 'EMALFORMED' });
+        const methodLength = buffer.readUInt32BE(offset); offset += 4;
+        if (offset + methodLength + 4 > buffer.length) throw new RpcError('binary request truncated', { code: 'EMALFORMED' });
+        const method = buffer.toString('utf8', offset, offset + methodLength); offset += methodLength;
+        const paramsLength = buffer.readUInt32BE(offset); offset += 4;
+        if (offset + paramsLength > buffer.length) throw new RpcError('binary request params truncated', { code: 'EMALFORMED' });
         const paramsJson = buffer.toString('utf8', offset, offset + paramsLength);
         const params = JSON.parse(paramsJson);
         offset += paramsLength;
-
-        // 剩余部分为二进制数据
-        const binaryData = buffer.slice(offset);
-
-        return {
-            method,
-            params,
-            binaryData
-        };
+        return { method, params, binaryData: buffer.subarray(offset) };
     }
 
-    // 修改 handleRequest 方法以支持二进制协议
+    // ========== 请求处理 ==========
     async handleRequest(id, request) {
-        // 检查 request 是否为 Buffer，如果是则使用二进制协议解码
         let method, params, args;
 
         if (Buffer.isBuffer(request)) {
-            // 使用二进制协议解码
             const decoded = RpcProtocol.decodeBinaryRequest(request);
             method = decoded.method;
             params = decoded.params;
-            // 将二进制数据作为第一个参数添加到参数列表
             args = [decoded.binaryData, ...params];
         } else {
-            // 使用现有的 JSON 协议
-            method = request.method;
-            params = request.params;
-
-            if (Array.isArray(params)) {
-                args = [...params];
-            } else if (params === null || params === undefined) {
-                args = [];
-            } else {
-                args = [params];
-            }
+            method = request?.method;
+            params = request?.params;
+            if (Array.isArray(params)) args = [...params];
+            else if (params === null || params === undefined) args = [];
+            else args = [params];
         }
 
-        const handler = this.handlers[method];
+        const handler = this.handlers?.[method];
         if (!handler) {
-            this.sendResponse(id, { error: `Method not found: ${method}` }, RpcProtocol.CONTENT_TYPES.JSON);
+            this.sendResponse(id, { error: `Method not found: ${method}` }, RpcProtocol.CONTENT_TYPES.JSON).catch(() => { });
             return;
         }
 
         try {
             const result = await handler(...args);
-
             let contentType = RpcProtocol.CONTENT_TYPES.JSON;
             let responseData = result;
 
-            if (result === undefined) {
-                // 处理 undefined 返回值
-                responseData = null; // 或者其他合适的默认值
+            if (result === undefined || result === null) {
+                responseData = null;
                 contentType = RpcProtocol.CONTENT_TYPES.JSON;
             } else if (typeof result === 'string') {
                 contentType = RpcProtocol.CONTENT_TYPES.TEXT;
             } else if (Buffer.isBuffer(result)) {
                 contentType = RpcProtocol.CONTENT_TYPES.BINARY;
             }
-            // console.log('[IPC] Sending response:', id, result, contentType);
-            this.sendResponse(id, responseData, contentType);
+            await this.sendResponse(id, responseData, contentType);
         } catch (err) {
-            this.sendResponse(id, { error: err.message }, RpcProtocol.CONTENT_TYPES.JSON);
+            await this.sendResponse(id, { error: err?.message || String(err) }, RpcProtocol.CONTENT_TYPES.JSON).catch(() => { });
         }
     }
 
-    // ========== 核心方法 ==========
     handleMessage(buffer) {
+        if (this._destroyed) return;
+        let parsed;
         try {
-            const { type, id, content, contentType } = RpcProtocol.deserialize(buffer);
+            parsed = RpcProtocol.deserialize(buffer);
+        } catch (err) {
+            this._safeEmit('error', new RpcError(`failed to deserialize: ${err.message}`, { code: 'EMALFORMED' }));
+            // 尽量回一个错误响应，避免对方永久等待
+            try {
+                if (buffer.length >= 18 && buffer.readUInt8(0) === RpcProtocol.TYPES.REQUEST) {
+                    const hex = buffer.subarray(2, 18).toString('hex');
+                    const id = `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+                    this.sendResponse(id, { error: 'Invalid request payload' }, RpcProtocol.CONTENT_TYPES.JSON).catch(() => { });
+                }
+            } catch { }
+            return;
+        }
 
-            // 验证协议字段
-            if (!Object.values(RpcProtocol.TYPES).includes(type)) {
-                throw new Error(`Invalid message type: ${type}`);
-            }
+        const { type, id, content, contentType } = parsed;
 
-            if (!Object.values(RpcProtocol.CONTENT_TYPES).includes(contentType)) {
-                throw new Error(`Invalid content type: ${contentType}`);
-            }
+        if (!Object.values(RpcProtocol.TYPES).includes(type) || !Object.values(RpcProtocol.CONTENT_TYPES).includes(contentType)) {
+            this._safeEmit('error', new RpcError(`invalid type/contentType ${type}/${contentType}`, { code: 'EMALFORMED' }));
+            return;
+        }
 
-            // 处理消息...
-            if (type === RpcProtocol.TYPES.REQUEST) {
-                // console.log('[IPC] Received request:', content);
-                this.handleRequest(id, content);
-            } else if (type === RpcProtocol.TYPES.RESPONSE) {
-                // console.log('[IPC] Received response:', content);
-                this.handleResponse(id, content);
-            } else if (type === RpcProtocol.TYPES.EVENT) {
-                // console.log('[IPC] Received event:', content);
-                this.emit('event', { contentType, content });
-            }
-        } catch (error) {
-            console.error('Failed to handle message:', error.message);
-            // 可以选择忽略错误消息或发送错误响应
+        if (type === RpcProtocol.TYPES.REQUEST) {
+            this.handleRequest(id, content).catch(err => {
+                this._safeEmit('error', new RpcError(`handler failure: ${err.message}`, { code: 'EHANDLER' }));
+            });
+        } else if (type === RpcProtocol.TYPES.RESPONSE) {
+            this.handleResponse(id, content);
+        } else if (type === RpcProtocol.TYPES.EVENT) {
+            this._safeEmit('event', { contentType, content });
         }
     }
 
     handleResponse(id, response) {
         const pending = this.pendingRequests.get(id);
-        if (pending) {
-            if (response && response.error) {
-                // pending.reject(new Error(response.error));
-                // 在开发环境中记录详细错误信息
-                // if (process.env.NODE_ENV !== 'production') {
-                //     console.error('[IPC] Received error response:', response);
-                // }
-                pending.reject(response.error); // 直接传递完整的响应结构
-            } else {
-                pending.resolve(response);
-            }
-            this.pendingRequests.delete(id);
+        if (!pending) return;
+        this.pendingRequests.delete(id);
+        if (pending.timer) clearTimeout(pending.timer);
+
+        if (response && typeof response === 'object' && 'error' in response && response.error) {
+            // ★ 统一用 Error 对象，保留远程错误信息
+            const message = typeof response.error === 'string' ? response.error : JSON.stringify(response.error);
+            pending.reject(new RpcError(message, { code: 'EREMOTE', remote: true, data: response.error }));
+        } else {
+            pending.resolve(response);
         }
     }
 
-    sendRaw(type, contentType, id, data) {
-        if (!this.messageStream) {
-            throw new Error('messageStream is not initialized');
+    handleStreamError(error) {
+        // 连接级错误：所有在途请求必须结算，否则永久泄漏
+        this._rejectAll(new RpcError(`stream error: ${error?.message || error}`, { code: error?.code || 'ESTREAM' }));
+    }
+
+    _rejectAll(err) {
+        if (!this.pendingRequests) return;
+        for (const [, pending] of this.pendingRequests) {
+            if (pending.timer) clearTimeout(pending.timer);
+            try { pending.reject(err); } catch { }
         }
+        this.pendingRequests.clear();
+    }
+
+    // ========== 发送 ==========
+    sendRaw(type, contentType, id, data) {
+        if (!this.messageStream) return Promise.reject(new RpcError('messageStream is not initialized', { code: 'ECLOSED' }));
         const message = RpcProtocol.serialize(type, contentType, id, data);
-        // console.log('[IPC] Sending message:', message);
-        // 使用实例方法发送
         return this.messageStream.send(message);
     }
 
-    sendRequest(method, params, to = undefined) {
-        // console.log('[IPC] Sending request:', method, params);
-        const id = uuidv4();
+    _track(id, timeoutMs, method) {
         return new Promise((resolve, reject) => {
-            this.pendingRequests.set(id, { resolve, reject });
-            this.sendRaw(RpcProtocol.TYPES.REQUEST, RpcProtocol.CONTENT_TYPES.JSON, id, {
-                method,
-                params,
-                to,
-            });
+            const pending = {
+                resolve: (v) => { if (pending.timer) clearTimeout(pending.timer); resolve(v); },
+                reject: (e) => { if (pending.timer) clearTimeout(pending.timer); reject(e); },
+                timer: null,
+            };
+            if (timeoutMs && timeoutMs > 0) {
+                pending.timer = setTimeout(() => {
+                    if (this.pendingRequests?.delete(id)) {
+                        reject(new RpcError(`RPC timeout after ${timeoutMs}ms: ${method}`, { code: 'ETIMEDOUT' }));
+                    }
+                }, timeoutMs);
+                pending.timer.unref?.();
+            }
+            this.pendingRequests.set(id, pending);
         });
+    }
+
+    _sendAndTrack(id, type, contentType, data, timeoutMs, method) {
+        const p = this._track(id, timeoutMs, method);
+        Promise.resolve(this.sendRaw(type, contentType, id, data)).catch(err => {
+            const pending = this.pendingRequests?.get(id);
+            if (pending) {
+                this.pendingRequests.delete(id);
+                if (pending.timer) clearTimeout(pending.timer);
+                pending.reject(new RpcError(`send failed: ${err?.message || err}`, { code: err?.code || 'ESEND' }));
+            }
+        });
+        return p;
+    }
+
+    sendRequest(method, params, to = undefined, timeoutMs = DEFAULT_TIMEOUT) {
+        const id = uuidv4();
+        return this._sendAndTrack(id, RpcProtocol.TYPES.REQUEST, RpcProtocol.CONTENT_TYPES.JSON,
+            { method, params, to }, timeoutMs, method);
+    }
+
+    sendRequestBinary(method, buffer, ...args) {
+        const timeoutMs = DEFAULT_TIMEOUT;
+        const id = uuidv4();
+        const binaryRequest = RpcProtocol.encodeBinaryRequest(method, args, buffer);
+        return this._sendAndTrack(id, RpcProtocol.TYPES.REQUEST, RpcProtocol.CONTENT_TYPES.BINARY,
+            binaryRequest, timeoutMs, method);
     }
 
     sendResponse(id, response, contentType = RpcProtocol.CONTENT_TYPES.JSON) {
-        this.sendRaw(RpcProtocol.TYPES.RESPONSE, contentType, id, response);
+        return this.sendRaw(RpcProtocol.TYPES.RESPONSE, contentType, id, response);
     }
 
-    onEvent(listener) {
-        this.on('event', listener);
-    }
+    onEvent(listener) { this.on('event', listener); }
 
-    registerMethod(name, handler) {
-        this.handlers[name] = handler;
-    }
+    registerMethod(name, handler) { this.handlers[name] = handler; }
 
-    // ========== 辅助方法 ==========
-    sendText(text) {
-        this.sendRaw(RpcProtocol.TYPES.EVENT, RpcProtocol.CONTENT_TYPES.TEXT, uuidv4(), text);
-    }
+    sendText(text) { return this.sendRaw(RpcProtocol.TYPES.EVENT, RpcProtocol.CONTENT_TYPES.TEXT, uuidv4(), text); }
+    sendBinary(data) { return this.sendRaw(RpcProtocol.TYPES.EVENT, RpcProtocol.CONTENT_TYPES.BINARY, uuidv4(), data); }
+    sendJson(data) { return this.sendRaw(RpcProtocol.TYPES.EVENT, RpcProtocol.CONTENT_TYPES.JSON, uuidv4(), data); }
 
-    sendBinary(data) {
-        this.sendRaw(RpcProtocol.TYPES.EVENT, RpcProtocol.CONTENT_TYPES.BINARY, uuidv4(), data);
-    }
-
-    sendJson(data) {
-        this.sendRaw(RpcProtocol.TYPES.EVENT, RpcProtocol.CONTENT_TYPES.JSON, uuidv4(), data);
-    }
-
-    /**
-    * 发送二进制数据请求并等待响应
-    * @param {string} method - 调用的方法名
-    * @param {Buffer|Uint8Array} buffer - 要发送的二进制数据
-    * @param {...any} args - 其他参数
-    * @returns {Promise<any>} 服务端响应结果
-    */
-    sendRequestBinary(method, buffer, ...args) {
-        const id = uuidv4();
-        return new Promise((resolve, reject) => {
-            this.pendingRequests.set(id, { resolve, reject });
-
-            // 使用自定义的二进制协议编码
-            const binaryRequest = RpcProtocol.encodeBinaryRequest(method, args, buffer);
-            this.sendRaw(RpcProtocol.TYPES.REQUEST, RpcProtocol.CONTENT_TYPES.BINARY, id, binaryRequest);
-        });
-    }
-
-    /**
-     * 销毁 RpcProtocol，清理所有资源
-     */
     destroy() {
-        // 拒绝所有待处理的请求
-        if (this.pendingRequests) {
-            for (const [id, pending] of this.pendingRequests) {
-                try {
-                    pending.reject(new Error('RPC Protocol destroyed'));
-                } catch (err) {
-                    console.error('Error rejecting pending request:', err);
-                }
-            }
-            this.pendingRequests.clear();
-            this.pendingRequests = null;
-        }
-
-        // 清理消息流
-        if (this.messageStream) {
-            this.messageStream.destroy();
-            this.messageStream = null;
-        }
-
-        // 清理处理器
+        if (this._destroyed) return;
+        this._destroyed = true;
+        this._rejectAll(new RpcError('RPC Protocol destroyed', { code: 'ECLOSED' }));
+        this.pendingRequests = null;
+        try { this.messageStream?.off('message', this._onMessage); } catch { }
+        try { this.messageStream?.off('error', this._onStreamError); } catch { }
+        try { this.messageStream?.off('syncComplete', this._onSync); } catch { }
+        try { this.messageStream?.destroy(); } catch { }
+        this.messageStream = null;
         this.handlers = null;
-
-        // 清理所有事件监听器
         this.removeAllListeners();
-
-        console.log('[RpcProtocol] Destroyed');
     }
 }

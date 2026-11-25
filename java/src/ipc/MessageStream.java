@@ -55,6 +55,8 @@ public class MessageStream implements Closeable {
     private final long maxBufferSize;
 
     private byte[] buffer = new byte[0];
+    private int head = 0;   // 逻辑读游标：消费只前移游标，避免 O(n^2) 全量复制
+    private int count = 0;
     private Integer expectedLength = null;
     private boolean protocolMode = false;
 
@@ -176,6 +178,47 @@ public class MessageStream implements Closeable {
         }
     }
 
+    // ========== 缓冲辅助（头游标 + 摊还 compact） ==========
+
+    private int bufLen() { return count; }
+
+    private void append(byte[] data, int n) {
+        if (head + count + n > buffer.length) {
+            int need = head + count + n;
+            int cap = buffer.length == 0 ? 4096 : buffer.length;
+            while (cap < need) cap *= 2;
+            byte[] grown = new byte[cap];
+            System.arraycopy(buffer, head, grown, 0, count);
+            buffer = grown;
+            head = 0;
+        }
+        System.arraycopy(data, 0, buffer, head + count, n);
+        count += n;
+    }
+
+    private void consume(int n) {
+        head += n;
+        count -= n;
+        if (head >= 1024 * 1024 || head >= count) {
+            System.arraycopy(buffer, head, buffer, 0, count);
+            head = 0;
+        }
+    }
+
+    private void clearBuffer() { head = 0; count = 0; }
+
+    private long readU32(int offset) { return readLe32(buffer, head + offset); }
+
+    private byte[] take(int n, int offset) { return Arrays.copyOfRange(buffer, head + offset, head + offset + n); }
+
+    private int findProtocolHeader() {
+        int window = Math.min(count, 64 * 1024);
+        for (int i = 0; i + 4 <= window; i++) {
+            if (readLe32(buffer, head + i) == PROTOCOL_HEADER) return i;
+        }
+        return -1;
+    }
+
     // ========== 接收 ==========
 
     private void readLoop() {
@@ -185,7 +228,7 @@ public class MessageStream implements Closeable {
                 int n = in.read(chunk);
                 if (n < 0) break;
                 synchronized (this) {
-                    onData(Arrays.copyOf(chunk, n));
+                    onData(chunk, n);
                 }
             }
         } catch (IOException err) {
@@ -194,48 +237,48 @@ public class MessageStream implements Closeable {
         if (!closed) emitError(new IOException("Connection closed"));
     }
 
-    private void onData(byte[] data) {
-        buffer = concat(buffer, data);
+    private void onData(byte[] data, int n) {
+        append(data, n);
 
-        if (buffer.length > maxBufferSize) {
-            emitError(new IOException("Buffer size: " + buffer.length + " exceeds maximum allowed limit"));
+        if (bufLen() > maxBufferSize) {
+            emitError(new IOException("Buffer size: " + bufLen() + " exceeds maximum allowed limit"));
             sendError("BUFFER_OVERFLOW");
             reset();
             return;
         }
 
-        while (buffer.length > 0) {
-            // 协议模式：只接受协议消息
-            if (protocolMode && buffer.length >= 8) {
-                if (readLe32(buffer, 0) == PROTOCOL_HEADER) {
-                    long length = readLe32(buffer, 4) & 0xFFFFFFFFL;
-                    long total = 8 + length;
-                    if (buffer.length >= total) {
-                        byte[] messageData = Arrays.copyOfRange(buffer, 8, (int) total);
-                        buffer = Arrays.copyOfRange(buffer, (int) total, buffer.length);
-                        if (handleProtocolMessage(messageData)) continue;
-                    } else {
-                        break; // 等待更多数据
+        while (bufLen() > 0) {
+            // 协议模式：扫描协议头，而不是整段丢弃（避免误丢 RESET_CONFIRM）
+            if (protocolMode) {
+                int idx = findProtocolHeader();
+                if (idx >= 0) {
+                    consume(idx);
+                    if (bufLen() < 8) break; // 等待长度字段
+                    long length = readU32(4);
+                    if (length > 50) {
+                        consume(8); // 伪头：跳过继续扫描
+                        continue;
                     }
-                } else {
-                    // 协议模式下的残留数据，丢弃
-                    System.out.println("[MessageStream] Dropping non-protocol data in protocol mode");
-                    buffer = new byte[0];
-                    break;
+                    if (bufLen() < 8 + length) break; // 等待协议消息收全
+                    byte[] messageData = take((int) length, 8);
+                    consume(8 + (int) length);
+                    handleProtocolMessage(messageData);
+                    continue;
                 }
+                // 窗口内无协议头：丢弃已扫描部分，保留尾部 3 字节（可能半截头）
+                consume(bufLen() - Math.min(3, bufLen()));
+                break;
             }
-
-            if (protocolMode) break; // 等待协议同步完成
 
             // 正常模式
             if (expectedLength == null) {
                 int headerSize = enableCRC ? 8 : 4;
-                if (buffer.length < headerSize) break;
+                if (bufLen() < headerSize) break;
 
-                int length = (int) readLe32(buffer, 0);
+                long length = readU32(0);
                 if (enableCRC) {
-                    long expectedCRC = readLe32(buffer, 4) & 0xFFFFFFFFL;
-                    long calculated = crc32(Arrays.copyOf(buffer, 4));
+                    long expectedCRC = readU32(4);
+                    long calculated = crc32(take(4, 0));
                     if (calculated != expectedCRC) {
                         System.err.println("Length header CRC check failed: expected " + expectedCRC + ", got " + calculated);
                         sendError("LENGTH_CRC_FAILED");
@@ -245,15 +288,24 @@ public class MessageStream implements Closeable {
                     }
                 }
 
-                expectedLength = length;
-                buffer = Arrays.copyOfRange(buffer, headerSize, buffer.length);
+                // 长度头强制校验：0 或超限视为坏帧（先用 long 比较，避免 cast 溢出为负）
+                if (length == 0 || length > maxBufferSize) {
+                    String code = length > maxBufferSize ? "BUFFER_OVERFLOW" : "LENGTH_CRC_FAILED";
+                    sendError(code);
+                    emitError(new IOException("invalid frame length " + length));
+                    reset();
+                    return;
+                }
+
+                expectedLength = (int) length;
+                consume(headerSize);
             }
 
             int messageTotalSize = enableCRC ? expectedLength + 4 : expectedLength;
-            if (buffer.length >= messageTotalSize) {
-                byte[] messageData = Arrays.copyOf(buffer, expectedLength);
+            if (bufLen() >= messageTotalSize) {
+                byte[] messageData = take(expectedLength, 0);
                 if (enableCRC) {
-                    long messageCRC = readLe32(buffer, expectedLength) & 0xFFFFFFFFL;
+                    long messageCRC = readU32(expectedLength);
                     long calculated = crc32(messageData);
                     if (calculated != messageCRC) {
                         System.err.println("Message CRC check failed: expected " + messageCRC + ", got " + calculated);
@@ -264,7 +316,7 @@ public class MessageStream implements Closeable {
                     }
                 }
 
-                buffer = Arrays.copyOfRange(buffer, messageTotalSize, buffer.length);
+                consume(messageTotalSize);
                 expectedLength = null;
 
                 // 错误包在交给上层之前拦截处理
@@ -284,18 +336,15 @@ public class MessageStream implements Closeable {
         }
     }
 
-    private boolean handleProtocolMessage(byte[] messageData) {
-        if (messageData.length > 50) return false;
+    private void handleProtocolMessage(byte[] messageData) {
         String text = new String(messageData, StandardCharsets.UTF_8).trim();
         if ("RESET_CONFIRM".equals(text)) {
             System.out.println("Received reset confirmation");
             protocolMode = false;
-            buffer = new byte[0];
+            clearBuffer();
             expectedLength = null;
             emitSyncComplete();
-            return true;
         }
-        return false;
     }
 
     private static boolean isErrorPacket(byte[] data) {
@@ -305,7 +354,7 @@ public class MessageStream implements Closeable {
     /** 清空接收状态并进入协议模式，等待对端 RESET_CONFIRM。 */
     public synchronized void reset() {
         System.out.println("[MessageStream] Resetting stream state");
-        buffer = new byte[0];
+        clearBuffer();
         expectedLength = null;
         protocolMode = true;
     }
@@ -317,7 +366,7 @@ public class MessageStream implements Closeable {
         try { in.close(); } catch (IOException ignored) {}
         try { out.close(); } catch (IOException ignored) {}
         synchronized (this) {
-            buffer = new byte[0];
+            clearBuffer();
             expectedLength = null;
         }
         synchronized (messageListeners) { messageListeners.clear(); }

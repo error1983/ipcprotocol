@@ -51,6 +51,7 @@ class MessageStream:
         self.max_buffer_size = max_buffer_size
 
         self._buffer = bytearray()
+        self._head = 0  # 逻辑读游标：消费只前移游标，避免 O(n^2) 头部删除
         self._expected_length = None
         self._protocol_mode = False
         self._send_lock = asyncio.Lock()
@@ -111,6 +112,33 @@ class MessageStream:
         except Exception as err:
             print(f"Failed to send protocol message '{message}': {err}")
 
+    # ========== 缓冲辅助（头游标 + 摊还 compact） ==========
+    def _buf_len(self):
+        return len(self._buffer) - self._head
+
+    def _read_u32(self, offset: int) -> int:
+        return struct.unpack_from('<I', self._buffer, self._head + offset)[0]
+
+    def _take(self, n: int, offset: int = 0) -> bytes:
+        start = self._head + offset
+        return bytes(self._buffer[start:start + n])
+
+    def _consume(self, n: int):
+        self._head += n
+        if self._head >= 1024 * 1024 or self._head * 2 >= len(self._buffer):
+            del self._buffer[:self._head]
+            self._head = 0
+
+    def _clear_buffer(self):
+        self._buffer.clear()
+        self._head = 0
+
+    def _find_protocol_header(self) -> int:
+        window = min(self._buf_len(), 64 * 1024)
+        if window < 4:
+            return -1
+        return self._buffer.find(PROTOCOL_HEADER, self._head, self._head + window)
+
     # ========== 接收 ==========
     async def _read_loop(self):
         try:
@@ -129,44 +157,45 @@ class MessageStream:
     def _on_data(self, data: bytes):
         self._buffer.extend(data)
 
-        if len(self._buffer) > self.max_buffer_size:
-            self._emit('error', f'Buffer size: {len(self._buffer)} exceeds maximum allowed limit')
+        if self._buf_len() > self.max_buffer_size:
+            self._emit('error', f'Buffer size: {self._buf_len()} exceeds maximum allowed limit')
             asyncio.get_event_loop().create_task(self.send_error('BUFFER_OVERFLOW'))
             self.reset()
             return
 
-        while len(self._buffer) > 0:
-            # 协议模式：只接受协议消息
-            if self._protocol_mode and len(self._buffer) >= 8:
-                if bytes(self._buffer[:4]) == PROTOCOL_HEADER:
-                    length = struct.unpack_from('<I', self._buffer, 4)[0]
-                    total = 8 + length
-                    if len(self._buffer) >= total:
-                        message_data = bytes(self._buffer[8:total])
-                        del self._buffer[:total]
-                        if self._handle_protocol_message(message_data):
-                            continue
-                    else:
-                        break  # 等待更多数据
-                else:
-                    # 协议模式下的残留数据，丢弃
-                    print('[MessageStream] Dropping non-protocol data in protocol mode')
-                    self._buffer.clear()
-                    break
-
+        while self._buf_len() > 0:
+            # 协议模式：扫描协议头，而不是整段丢弃（避免误丢 RESET_CONFIRM）
             if self._protocol_mode:
-                break  # 等待协议同步完成
+                idx = self._find_protocol_header()
+                if idx >= 0:
+                    self._consume(idx - self._head)
+                    if self._buf_len() < 8:
+                        break  # 等待长度字段
+                    length = self._read_u32(4)
+                    if length > 50:
+                        self._consume(8)  # 伪头：跳过继续扫描
+                        continue
+                    if self._buf_len() < 8 + length:
+                        break  # 等待协议消息收全
+                    message_data = self._take(length, 8)
+                    self._consume(8 + length)
+                    self._handle_protocol_message(message_data)
+                    continue
+                # 窗口内无协议头：丢弃已扫描部分，保留尾部 3 字节（可能半截头）
+                keep = min(3, self._buf_len())
+                self._consume(self._buf_len() - keep)
+                break
 
             # 正常模式
             if self._expected_length is None:
                 header_size = 8 if self.enable_crc else 4
-                if len(self._buffer) < header_size:
+                if self._buf_len() < header_size:
                     break
 
-                length = struct.unpack_from('<I', self._buffer, 0)[0]
+                length = self._read_u32(0)
                 if self.enable_crc:
-                    expected_crc = struct.unpack_from('<I', self._buffer, 4)[0]
-                    calculated = zlib.crc32(bytes(self._buffer[:4]))
+                    expected_crc = self._read_u32(4)
+                    calculated = zlib.crc32(self._take(4))
                     if calculated != expected_crc:
                         print(f'Length header CRC check failed: expected {expected_crc}, got {calculated}')
                         asyncio.get_event_loop().create_task(self.send_error('LENGTH_CRC_FAILED'))
@@ -174,14 +203,22 @@ class MessageStream:
                         self.reset()
                         return
 
+                # 长度头强制校验：0 或超限视为坏帧（CRC 合法也可能是伪造/损坏的长度）
+                if length == 0 or length > self.max_buffer_size:
+                    code = 'BUFFER_OVERFLOW' if length > self.max_buffer_size else 'LENGTH_CRC_FAILED'
+                    asyncio.get_event_loop().create_task(self.send_error(code))
+                    self._emit('error', ValueError(f'invalid frame length {length}'))
+                    self.reset()
+                    return
+
                 self._expected_length = length
-                del self._buffer[:header_size]
+                self._consume(header_size)
 
             total = self._expected_length + (4 if self.enable_crc else 0)
-            if len(self._buffer) >= total:
-                message_data = bytes(self._buffer[:self._expected_length])
+            if self._buf_len() >= total:
+                message_data = self._take(self._expected_length)
                 if self.enable_crc:
-                    message_crc = struct.unpack_from('<I', self._buffer, self._expected_length)[0]
+                    message_crc = self._read_u32(self._expected_length)
                     calculated = zlib.crc32(message_data)
                     if calculated != message_crc:
                         print(f'Message CRC check failed: expected {message_crc}, got {calculated}')
@@ -190,7 +227,7 @@ class MessageStream:
                         self.reset()
                         return
 
-                del self._buffer[:total]
+                self._consume(total)
                 self._expected_length = None
 
                 # 错误包在交给上层之前拦截处理
@@ -207,13 +244,11 @@ class MessageStream:
                 break
 
     def _handle_protocol_message(self, message_data: bytes) -> bool:
-        if len(message_data) > 50:
-            return False
         text = message_data.decode('utf8', errors='replace').strip()
         if text == 'RESET_CONFIRM':
             print('Received reset confirmation')
             self._protocol_mode = False
-            self._buffer.clear()
+            self._clear_buffer()
             self._expected_length = None
             self._emit('syncComplete')
             return True
@@ -226,13 +261,13 @@ class MessageStream:
     def reset(self):
         """清空接收状态并进入协议模式，等待对端 RESET_CONFIRM。"""
         print('[MessageStream] Resetting stream state')
-        self._buffer.clear()
+        self._clear_buffer()
         self._expected_length = None
         self._protocol_mode = True
 
     def get_status(self):
         return {
-            'bufferLength': len(self._buffer),
+            'bufferLength': self._buf_len(),
             'expectedLength': self._expected_length,
             'enableCRC': self.enable_crc,
             'protocolMode': self._protocol_mode,
@@ -248,7 +283,7 @@ class MessageStream:
             await self._writer.wait_closed()
         except Exception:
             pass
-        self._buffer.clear()
+        self._clear_buffer()
         self._listeners.clear()
         print('[MessageStream] Destroyed')
 

@@ -75,12 +75,18 @@ def encode_binary_request(method: str, params, binary_data: bytes) -> bytes:
 
 def decode_binary_request(buffer: bytes):
     offset = 0
+    if len(buffer) < 4:
+        raise ValueError('binary request too short')
     method_len = struct.unpack_from('>I', buffer, offset)[0]
     offset += 4
+    if len(buffer) < offset + method_len + 4:
+        raise ValueError('binary request truncated (method)')
     method = buffer[offset:offset + method_len].decode('utf8')
     offset += method_len
     params_len = struct.unpack_from('>I', buffer, offset)[0]
     offset += 4
+    if len(buffer) < offset + params_len:
+        raise ValueError('binary request truncated (params)')
     params = json.loads(buffer[offset:offset + params_len].decode('utf8'))
     offset += params_len
     return {'method': method, 'params': params, 'binaryData': buffer[offset:]}
@@ -151,21 +157,37 @@ class RpcProtocol:
                 self._emit('event', {'contentType': msg['contentType'], 'content': msg['content']})
         except Exception as err:
             print(f'Failed to handle message: {err}')
+            # 畸形 REQUEST 尽量回错误响应，避免调用方永久等待（对齐 JS 修复版）
+            if len(buffer) >= 18 and buffer[0] == TYPES['REQUEST']:
+                try:
+                    msg_id = str(uuid.UUID(bytes=buffer[2:18]))
+                    asyncio.get_event_loop().create_task(
+                        self.send_response(msg_id, {'error': 'Invalid request payload'}))
+                except Exception:
+                    pass
 
     async def _handle_request(self, msg_id: str, request):
-        if isinstance(request, (bytes, bytearray)):
-            decoded = decode_binary_request(bytes(request))
-            method = decoded['method']
-            args = [decoded['binaryData'], *decoded['params']]
-        else:
-            method = request.get('method')
-            params = request.get('params')
-            if isinstance(params, list):
-                args = list(params)
-            elif params is None:
-                args = []
+        try:
+            if isinstance(request, (bytes, bytearray)):
+                decoded = decode_binary_request(bytes(request))
+                method = decoded['method']
+                args = [decoded['binaryData'], *decoded['params']]
+            elif isinstance(request, dict):
+                method = request.get('method')
+                params = request.get('params')
+                if isinstance(params, list):
+                    args = list(params)
+                elif params is None:
+                    args = []
+                else:
+                    args = [params]
             else:
-                args = [params]
+                raise ValueError('request payload is not an object')
+            if not isinstance(method, str) or not method:
+                raise ValueError('request method missing')
+        except Exception as err:
+            await self.send_response(msg_id, {'error': f'Invalid request payload: {err}'})
+            return
 
         handler = self.handlers.get(method)
         if handler is None:
@@ -252,6 +274,9 @@ class RpcProtocol:
         self.handlers[name] = handler
 
     async def destroy(self):
+        if self._destroyed:
+            return
+        self._destroyed = True
         for pending in self.pending_requests.values():
             if not pending.done():
                 pending.set_exception(RpcError('RPC Protocol destroyed'))
@@ -261,5 +286,4 @@ class RpcProtocol:
             self.message_stream = None
         self.handlers.clear()
         self._listeners.clear()
-        self._destroyed = True
         print('[RpcProtocol] Destroyed')

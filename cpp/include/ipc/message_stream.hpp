@@ -127,14 +127,42 @@ private:
 
     // 以下状态仅读线程访问
     std::vector<uint8_t> buf_;
+    size_t head_ = 0; // 逻辑读游标：消费只前移游标，避免 O(n^2) 头部删除
     bool protocolMode_ = false;
     long expectedLen_ = -1;
 
     void emitError(const std::string& msg) { if (onError) onError(msg); }
 
+    size_t bufLen() const { return buf_.size() - head_; }
+    const uint8_t* bufData() const { return buf_.data() + head_; }
+
+    void consume(size_t n) {
+        head_ += n;
+        if (head_ >= 1024 * 1024 || head_ >= bufLen()) {
+            buf_.erase(buf_.begin(), buf_.begin() + head_);
+            head_ = 0;
+        }
+    }
+
+    void clearBuf() {
+        buf_.clear();
+        head_ = 0;
+    }
+
+    // 在 64KB 窗口内扫描协议头，返回相对偏移；未找到返回 -1
+    ptrdiff_t findProtocolHeader() const {
+        size_t window = bufLen() < 64 * 1024 ? bufLen() : 64 * 1024;
+        if (window < 4) return -1;
+        const uint8_t* d = bufData();
+        for (size_t i = 0; i + 4 <= window; i++) {
+            if (readLe32(d + i) == 0xFFFFFFFFu) return static_cast<ptrdiff_t>(i);
+        }
+        return -1;
+    }
+
     void reset() {
         protocolMode_ = true;
-        buf_.clear();
+        clearBuf();
         expectedLen_ = -1;
     }
 
@@ -155,59 +183,74 @@ private:
 
     void processBuffer() {
         for (;;) {
-            if (buf_.size() > maxBufferSize_) {
+            if (bufLen() > maxBufferSize_) {
                 emitError("buffer overflow");
                 sendError(ERR_BUFFER_OVERFLOW);
                 reset();
                 return;
             }
             if (protocolMode_) {
-                if (buf_.size() >= 8) {
-                    if (readLe32(buf_.data()) == 0xFFFFFFFFu) {
-                        uint32_t length = readLe32(buf_.data() + 4);
-                        if (length <= 50 && buf_.size() >= 8 + length) {
-                            std::string text(reinterpret_cast<const char*>(buf_.data() + 8), length);
-                            buf_.erase(buf_.begin(), buf_.begin() + 8 + length);
-                            // trim
-                            size_t b = text.find_first_not_of(" \t\n\r");
-                            size_t e = text.find_last_not_of(" \t\n\r");
-                            std::string trimmed = (b == std::string::npos) ? "" : text.substr(b, e - b + 1);
-                            if (trimmed == "RESET_CONFIRM") {
-                                protocolMode_ = false;
-                                buf_.clear();
-                                if (onSyncComplete) onSyncComplete();
-                            }
-                            continue;
-                        }
-                        return; // 协议消息未收全
+                // 扫描协议头，而不是整段丢弃（避免误丢 RESET_CONFIRM）
+                ptrdiff_t idx = findProtocolHeader();
+                if (idx >= 0) {
+                    consume(static_cast<size_t>(idx));
+                    if (bufLen() < 8) return; // 等待长度字段
+                    uint32_t length = readLe32(bufData() + 4);
+                    if (length > 50) {
+                        consume(8); // 伪头：跳过继续扫描
+                        continue;
                     }
-                    buf_.clear(); // 无协议头：丢弃脏数据
+                    if (bufLen() < 8 + length) return; // 协议消息未收全
+                    std::string text(reinterpret_cast<const char*>(bufData() + 8), length);
+                    consume(8 + length);
+                    // trim
+                    size_t b = text.find_first_not_of(" \t\n\r");
+                    size_t e = text.find_last_not_of(" \t\n\r");
+                    std::string trimmed = (b == std::string::npos) ? "" : text.substr(b, e - b + 1);
+                    if (trimmed == "RESET_CONFIRM") {
+                        protocolMode_ = false;
+                        clearBuf();
+                        if (onSyncComplete) onSyncComplete();
+                    }
+                    continue;
                 }
+                // 窗口内无协议头：丢弃已扫描部分，保留尾部 3 字节（可能半截头）
+                size_t keep = bufLen() < 3 ? bufLen() : 3;
+                consume(bufLen() - keep);
                 return;
             }
 
             size_t headerSize = enableCRC_ ? 8 : 4;
             if (expectedLen_ < 0) {
-                if (buf_.size() < headerSize) return;
-                uint32_t length = readLe32(buf_.data());
+                if (bufLen() < headerSize) return;
+                uint32_t length = readLe32(bufData());
                 if (enableCRC_) {
-                    uint32_t expected = readLe32(buf_.data() + 4);
-                    if (crc32(buf_.data(), 4) != expected) {
+                    uint32_t expected = readLe32(bufData() + 4);
+                    if (crc32(bufData(), 4) != expected) {
                         sendError(ERR_LENGTH_CRC_FAILED);
                         emitError("length header CRC check failed");
                         reset();
                         return;
                     }
                 }
+                // 长度头强制校验：0 或超限视为坏帧（CRC 合法也可能是伪造/损坏的长度）
+                if (length == 0 || static_cast<uint64_t>(length) > maxBufferSize_) {
+                    uint8_t code = static_cast<uint64_t>(length) > maxBufferSize_
+                                       ? ERR_BUFFER_OVERFLOW : ERR_LENGTH_CRC_FAILED;
+                    sendError(code);
+                    emitError("invalid frame length " + std::to_string(length));
+                    reset();
+                    return;
+                }
                 expectedLen_ = static_cast<long>(length);
-                buf_.erase(buf_.begin(), buf_.begin() + headerSize);
+                consume(headerSize);
             }
 
             size_t totalSize = static_cast<size_t>(expectedLen_) + (enableCRC_ ? 4 : 0);
-            if (buf_.size() < totalSize) return;
-            std::vector<uint8_t> data(buf_.begin(), buf_.begin() + expectedLen_);
+            if (bufLen() < totalSize) return;
+            std::vector<uint8_t> data(bufData(), bufData() + expectedLen_);
             if (enableCRC_) {
-                uint32_t expected = readLe32(buf_.data() + expectedLen_);
+                uint32_t expected = readLe32(bufData() + expectedLen_);
                 if (crc32(data.data(), data.size()) != expected) {
                     sendError(ERR_MESSAGE_CRC_FAILED);
                     emitError("message CRC check failed");
@@ -215,7 +258,7 @@ private:
                     return;
                 }
             }
-            buf_.erase(buf_.begin(), buf_.begin() + totalSize);
+            consume(totalSize);
             expectedLen_ = -1;
             // 错误包可能 reset 清空缓冲区，故先消费再分发
             if (data.size() == 5 && data[0] == 0xEE && data[1] == 0xEE && data[2] == 0xEE && data[3] == 0xEE) {
