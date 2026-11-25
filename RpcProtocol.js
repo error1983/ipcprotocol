@@ -6,6 +6,7 @@ import { EventEmitter } from 'events';
 export { uuidv4 }
 
 const DEFAULT_TIMEOUT = 15000;
+const PROTOCOL_VERSION = 1;
 
 export class RpcError extends Error {
     constructor(message, { code = 'RPC_ERROR', remote = false, data = undefined } = {}) {
@@ -18,13 +19,26 @@ export class RpcError extends Error {
 }
 
 export class RpcProtocol extends EventEmitter {
-    constructor(messageStream) {
+    constructor(messageStream, options = {}) {
         if (!messageStream) throw new Error('messageStream is undefined');
         super();
         this.messageStream = messageStream;
         this.handlers = {};
         this.pendingRequests = new Map();
         this._destroyed = false;
+
+        // v1.1：心跳与可选 HELLO 握手（PROTOCOL.md §8.1/§8.2）
+        this.heartbeatIntervalMs = options.heartbeatIntervalMs ?? 5000;
+        this.heartbeatTimeoutMs = options.heartbeatTimeoutMs ?? 15000;
+        this.authToken = options.authToken ?? null;
+        this.requiredToken = options.requiredToken ?? null;
+        this._authenticated = false;
+        this._lastReceived = Date.now();
+        this._heartbeatTimer = null;
+        if (this.heartbeatIntervalMs > 0) {
+            this._heartbeatTimer = setInterval(() => this._heartbeatTick(), this.heartbeatIntervalMs);
+            this._heartbeatTimer.unref?.();
+        }
 
         this._onMessage = (buffer) => this.handleMessage(buffer);
         this._onStreamError = (error) => {
@@ -44,7 +58,7 @@ export class RpcProtocol extends EventEmitter {
     }
 
     // ========== 协议定义 ==========
-    static TYPES = { REQUEST: 0, RESPONSE: 1, EVENT: 2 };
+    static TYPES = { REQUEST: 0, RESPONSE: 1, EVENT: 2, PING: 3, PONG: 4, HELLO: 5, HELLO_ACK: 6 };
     static CONTENT_TYPES = { TEXT: 0, JSON: 1, BINARY: 2 };
 
     static serialize(type, contentType, id, data) {
@@ -159,6 +173,7 @@ export class RpcProtocol extends EventEmitter {
 
     handleMessage(buffer) {
         if (this._destroyed) return;
+        this._lastReceived = Date.now();   // 任何入站消息都刷新心跳活动时刻
         let parsed;
         try {
             parsed = RpcProtocol.deserialize(buffer);
@@ -183,14 +198,83 @@ export class RpcProtocol extends EventEmitter {
         }
 
         if (type === RpcProtocol.TYPES.REQUEST) {
+            if (this.requiredToken && !this._authenticated) {
+                this.sendResponse(id, { error: 'Unauthorized' }, RpcProtocol.CONTENT_TYPES.JSON)
+                    .then(() => this.destroy()).catch(() => this.destroy());
+                return;
+            }
             this.handleRequest(id, content).catch(err => {
                 this._safeEmit('error', new RpcError(`handler failure: ${err.message}`, { code: 'EHANDLER' }));
             });
         } else if (type === RpcProtocol.TYPES.RESPONSE) {
             this.handleResponse(id, content);
         } else if (type === RpcProtocol.TYPES.EVENT) {
+            if (this.requiredToken && !this._authenticated) return;   // 未鉴权事件丢弃
             this._safeEmit('event', { contentType, content });
+        } else if (type === RpcProtocol.TYPES.PING) {
+            this.sendRaw(RpcProtocol.TYPES.PONG, RpcProtocol.CONTENT_TYPES.TEXT, id, '').catch(() => { });
+        } else if (type === RpcProtocol.TYPES.PONG) {
+            // 仅刷新 lastReceived，不交付应用层
+        } else if (type === RpcProtocol.TYPES.HELLO) {
+            this.handleHello(id, content);
+        } else if (type === RpcProtocol.TYPES.HELLO_ACK) {
+            this.handleHelloAck(id, content);
         }
+    }
+
+    // ========== 心跳（§8.1） ==========
+    _heartbeatTick() {
+        if (this._destroyed) return;
+        const silent = Date.now() - this._lastReceived;
+        if (this.heartbeatTimeoutMs > 0 && silent >= this.heartbeatTimeoutMs) {
+            const err = new RpcError(`heartbeat timeout: no data for ${silent}ms`, { code: 'EHEARTBEAT' });
+            this._rejectAll(err);
+            this._safeEmit('error', err);
+            this.destroy();
+            return;
+        }
+        if (silent >= this.heartbeatIntervalMs) {
+            this.sendRaw(RpcProtocol.TYPES.PING, RpcProtocol.CONTENT_TYPES.TEXT, uuidv4(), '').catch(() => { });
+        }
+    }
+
+    // ========== HELLO 握手（§8.2） ==========
+    handleHello(id, content) {
+        const version = content?.version;
+        let ack, fail = false;
+        if (version !== PROTOCOL_VERSION) {
+            ack = { error: `unsupported protocol version: ${version}` }; fail = true;
+        } else if (this.requiredToken && content?.token !== this.requiredToken) {
+            ack = { error: 'unauthorized' }; fail = true;
+        } else {
+            this._authenticated = true;
+            ack = { version: PROTOCOL_VERSION, ok: true };
+        }
+        this.sendRaw(RpcProtocol.TYPES.HELLO_ACK, RpcProtocol.CONTENT_TYPES.JSON, id, ack)
+            .then(() => { if (fail) this.destroy(); })
+            .catch(() => { if (fail) this.destroy(); });
+    }
+
+    handleHelloAck(id, content) {
+        const pending = this.pendingRequests.get(id);
+        if (!pending) return;
+        this.pendingRequests.delete(id);
+        if (pending.timer) clearTimeout(pending.timer);
+        if (content && typeof content === 'object' && content.error) {
+            pending.reject(new RpcError(String(content.error), { code: 'EAUTH', remote: true, data: content.error }));
+        } else if (!content || content.version !== PROTOCOL_VERSION) {
+            pending.reject(new RpcError(`unsupported protocol version: ${content?.version}`, { code: 'EVERSION', remote: true }));
+        } else {
+            pending.resolve(content);
+        }
+    }
+
+    /** 显式握手：启用鉴权时调用方必须先 await hello() 再发业务请求 */
+    hello(timeoutMs = DEFAULT_TIMEOUT) {
+        const id = uuidv4();
+        const payload = { version: PROTOCOL_VERSION };
+        if (this.authToken) payload.token = this.authToken;
+        return this._sendAndTrack(id, RpcProtocol.TYPES.HELLO, RpcProtocol.CONTENT_TYPES.JSON, payload, timeoutMs, 'hello');
     }
 
     handleResponse(id, response) {
@@ -290,6 +374,7 @@ export class RpcProtocol extends EventEmitter {
     destroy() {
         if (this._destroyed) return;
         this._destroyed = true;
+        if (this._heartbeatTimer) { clearInterval(this._heartbeatTimer); this._heartbeatTimer = null; }
         this._rejectAll(new RpcError('RPC Protocol destroyed', { code: 'ECLOSED' }));
         this.pendingRequests = null;
         try { this.messageStream?.off('message', this._onMessage); } catch { }

@@ -14,7 +14,7 @@ using System.Text.Json;
 
 namespace IpcProtocol;
 
-public enum MessageType : byte { Request = 0, Response = 1, Event = 2 }
+public enum MessageType : byte { Request = 0, Response = 1, Event = 2, Ping = 3, Pong = 4, Hello = 5, HelloAck = 6 }
 public enum ContentType : byte { Text = 0, Json = 1, Binary = 2 }
 
 /// <summary>对端返回的错误响应，Error 属性携带原始 error 值（string 或 JsonElement）；Code 为错误码（如 ETIMEDOUT/EREMOTE）。</summary>
@@ -39,7 +39,7 @@ public sealed class RpcProtocol : IDisposable
 {
     public static class Types
     {
-        public const byte Request = 0, Response = 1, Event = 2;
+        public const byte Request = 0, Response = 1, Event = 2, Ping = 3, Pong = 4, Hello = 5, HelloAck = 6;
     }
     public static class ContentTypes
     {
@@ -58,6 +58,16 @@ public sealed class RpcProtocol : IDisposable
 
     /// <summary>默认 RPC 超时，对齐 JS 修复版 15s；TimeSpan.Zero 表示关闭。</summary>
     public TimeSpan DefaultTimeout { get; set; } = TimeSpan.FromSeconds(15);
+
+    // v1.1：心跳与可选 HELLO 握手（PROTOCOL.md §8.1/§8.2）
+    public TimeSpan HeartbeatInterval { get; }
+    public TimeSpan HeartbeatTimeout { get; }
+    public string? AuthToken { get; }
+    public string? RequiredToken { get; }
+    private bool _authenticated;
+    private long _lastReceivedTicks = Environment.TickCount64;
+    private readonly CancellationTokenSource? _heartbeatCts;
+    private const int ProtocolVersion = 1;
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -88,13 +98,127 @@ public sealed class RpcProtocol : IDisposable
         }
     }
 
-    public RpcProtocol(MessageStream messageStream)
+    public RpcProtocol(MessageStream messageStream, TimeSpan? heartbeatInterval = null,
+        TimeSpan? heartbeatTimeout = null, string? authToken = null, string? requiredToken = null)
     {
         _messageStream = messageStream ?? throw new ArgumentNullException(nameof(messageStream));
+        HeartbeatInterval = heartbeatInterval ?? TimeSpan.FromSeconds(5);
+        HeartbeatTimeout = heartbeatTimeout ?? TimeSpan.FromSeconds(15);
+        AuthToken = authToken;
+        RequiredToken = requiredToken;
         _messageStream.Message += OnMessage;
         _messageStream.Error += OnStreamError;
         // 先挂好监听器再启动读循环，避免早到消息在注册前被分发的竞态
         _messageStream.Start();
+        if (HeartbeatInterval > TimeSpan.Zero)
+        {
+            _heartbeatCts = new CancellationTokenSource();
+            _ = HeartbeatLoopAsync(_heartbeatCts.Token);
+        }
+    }
+
+    // ========== 心跳（§8.1） ==========
+
+    private async Task HeartbeatLoopAsync(CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested && !_disposed)
+        {
+            try { await Task.Delay(HeartbeatInterval, ct).ConfigureAwait(false); }
+            catch (OperationCanceledException) { return; }
+            if (_disposed) return;
+            long silent = Environment.TickCount64 - Interlocked.Read(ref _lastReceivedTicks);
+            if (HeartbeatTimeout > TimeSpan.Zero && silent >= (long)HeartbeatTimeout.TotalMilliseconds)
+            {
+                var err = new RpcException($"heartbeat timeout: no data for {silent}ms", "EHEARTBEAT");
+                foreach (var key in _pendingRequests.Keys)
+                    if (_pendingRequests.TryRemove(key, out var pending))
+                        pending.TrySetException(err);
+                Error?.Invoke(err);
+                Dispose();
+                return;
+            }
+            if (silent >= (long)HeartbeatInterval.TotalMilliseconds)
+            {
+                try { await SendRawAsync(Types.Ping, ContentTypes.Text, Guid.NewGuid().ToString(), "").ConfigureAwait(false); }
+                catch { /* ignore */ }
+            }
+        }
+    }
+
+    // ========== HELLO 握手（§8.2） ==========
+
+    private async Task HandleHelloAsync(string id, object? content)
+    {
+        int? version = content is JsonElement j && j.ValueKind == JsonValueKind.Object
+            && j.TryGetProperty("version", out var v) && v.ValueKind == JsonValueKind.Number
+            ? v.GetInt32() : null;
+        string? token = content is JsonElement jt && jt.ValueKind == JsonValueKind.Object
+            && jt.TryGetProperty("token", out var t) && t.ValueKind == JsonValueKind.String
+            ? t.GetString() : null;
+        object ack;
+        bool fail = false;
+        if (version != ProtocolVersion)
+        {
+            ack = new { error = $"unsupported protocol version: {version}" }; fail = true;
+        }
+        else if (!string.IsNullOrEmpty(RequiredToken) && token != RequiredToken)
+        {
+            ack = new { error = "unauthorized" }; fail = true;
+        }
+        else
+        {
+            _authenticated = true;
+            ack = new { version = ProtocolVersion, ok = true };
+        }
+        try { await SendRawAsync(Types.HelloAck, ContentTypes.Json, id, ack).ConfigureAwait(false); }
+        catch { /* ignore */ }
+        if (fail) Dispose();
+    }
+
+    private void HandleHelloAck(string id, object? content)
+    {
+        if (!_pendingRequests.TryRemove(id, out var pending)) return;
+        if (content is JsonElement json && json.ValueKind == JsonValueKind.Object)
+        {
+            if (json.TryGetProperty("error", out var error) && IsTruthy(error))
+            {
+                pending.TrySetException(new RpcException(
+                    error.ValueKind == JsonValueKind.String ? error.GetString() : (object?)error, "EAUTH"));
+                return;
+            }
+            if (json.TryGetProperty("version", out var v) && v.ValueKind == JsonValueKind.Number
+                && v.GetInt32() == ProtocolVersion)
+            {
+                pending.TrySetResult(content);
+                return;
+            }
+            pending.TrySetException(new RpcException($"unsupported protocol version: {json}", "EVERSION"));
+        }
+        else
+        {
+            pending.TrySetException(new RpcException("unsupported protocol version: null", "EVERSION"));
+        }
+    }
+
+    /// <summary>显式握手：启用鉴权时调用方必须先 await HelloAsync() 再发业务请求。</summary>
+    public async Task<object?> HelloAsync(TimeSpan? timeout = null)
+    {
+        var id = Guid.NewGuid().ToString();
+        var tcs = new TaskCompletionSource<object?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        _pendingRequests[id] = tcs;
+        object payload = AuthToken is null
+            ? new { version = ProtocolVersion }
+            : new { version = ProtocolVersion, token = AuthToken };
+        try
+        {
+            await SendRawAsync(Types.Hello, ContentTypes.Json, id, payload).ConfigureAwait(false);
+        }
+        catch (Exception err)
+        {
+            _pendingRequests.TryRemove(id, out _);
+            tcs.TrySetException(err);
+        }
+        return await WaitPendingAsync(id, tcs, "hello", timeout).ConfigureAwait(false);
     }
 
     // ========== 序列化 ==========
@@ -171,22 +295,40 @@ public sealed class RpcProtocol : IDisposable
 
     private void OnMessage(byte[] buffer)
     {
+        Interlocked.Exchange(ref _lastReceivedTicks, Environment.TickCount64);  // 任何入站消息刷新心跳活动
         try
         {
             var (type, contentType, id, content) = Deserialize(buffer);
-            if (type > 2) throw new InvalidDataException($"Invalid message type: {type}");
+            if (type > 6) throw new InvalidDataException($"Invalid message type: {type}");
             if (contentType > 2) throw new InvalidDataException($"Invalid content type: {contentType}");
 
             switch (type)
             {
                 case Types.Request:
+                    if (!string.IsNullOrEmpty(RequiredToken) && !_authenticated)
+                    {
+                        _ = RejectUnauthorizedAsync(id);
+                        break;
+                    }
                     _ = HandleRequestAsync(id, content);
                     break;
                 case Types.Response:
                     HandleResponse(id, content);
                     break;
                 case Types.Event:
+                    if (!string.IsNullOrEmpty(RequiredToken) && !_authenticated) break;  // 未鉴权事件丢弃
                     Event?.Invoke(new RpcEvent { ContentType = (ContentType)contentType, Content = content });
+                    break;
+                case Types.Ping:
+                    _ = SendPongAsync(id);
+                    break;
+                case Types.Pong:
+                    break;  // 仅刷新 _lastReceivedTicks，不交付应用层
+                case Types.Hello:
+                    _ = HandleHelloAsync(id, content);
+                    break;
+                case Types.HelloAck:
+                    HandleHelloAck(id, content);
                     break;
             }
         }
@@ -205,6 +347,19 @@ public sealed class RpcProtocol : IDisposable
                 catch { /* ignore */ }
             }
         }
+    }
+
+    private async Task SendPongAsync(string id)
+    {
+        try { await SendRawAsync(Types.Pong, ContentTypes.Text, id, "").ConfigureAwait(false); }
+        catch { /* ignore */ }
+    }
+
+    private async Task RejectUnauthorizedAsync(string id)
+    {
+        try { await SendResponseAsync(id, new { error = "Unauthorized" }).ConfigureAwait(false); }
+        catch { /* ignore */ }
+        Dispose();
     }
 
     private async Task HandleRequestAsync(string id, object? request)
@@ -293,10 +448,11 @@ public sealed class RpcProtocol : IDisposable
 
     private void OnStreamError(Exception error)
     {
+        string? code = (error as StreamException)?.Code;  // 错误码透传（ERESYNC/ERESYNC_TIMEOUT 等）
         foreach (var key in _pendingRequests.Keys)
         {
             if (_pendingRequests.TryRemove(key, out var pending))
-                pending.TrySetException(new RpcException($"Request failed: {error.Message}"));
+                pending.TrySetException(new RpcException($"Request failed: {error.Message}", code));
         }
         Error?.Invoke(error);
     }
@@ -413,6 +569,7 @@ public sealed class RpcProtocol : IDisposable
     {
         if (_disposed) return;
         _disposed = true;
+        _heartbeatCts?.Cancel();
         foreach (var key in _pendingRequests.Keys)
         {
             if (_pendingRequests.TryRemove(key, out var pending))

@@ -3,6 +3,8 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #include <functional>
@@ -18,6 +20,12 @@ namespace ipc {
 constexpr uint8_t ERR_LENGTH_CRC_FAILED = 1;
 constexpr uint8_t ERR_MESSAGE_CRC_FAILED = 2;
 constexpr uint8_t ERR_BUFFER_OVERFLOW = 3;
+
+// 带错误码的流错误（对齐 JS 修复版 ipcError 的 code 字段）。
+struct StreamError {
+    std::string message;
+    std::string code;
+};
 
 // 传输抽象：任意双向字节流（TCP/管道等）。read 返回字节数，0=EOF，-1=错误。
 class ByteStream {
@@ -57,15 +65,17 @@ inline void writeLe32(uint8_t* p, uint32_t v) {
     p[3] = static_cast<uint8_t>(v >> 24);
 }
 
-class MessageStream {
+class MessageStream : public std::enable_shared_from_this<MessageStream> {
 public:
     std::function<void(const std::vector<uint8_t>&)> onMessage;
-    std::function<void(const std::string&)> onError;
+    std::function<void(const StreamError&)> onError;
     std::function<void()> onSyncComplete;
 
+    // syncTimeoutMs：重同步握手超时（PROTOCOL.md §4.5），<=0 关闭。
     MessageStream(std::shared_ptr<ByteStream> io, bool enableCRC = true,
-                  size_t maxBufferSize = 256 * 1024 * 1024)
-        : io_(std::move(io)), enableCRC_(enableCRC), maxBufferSize_(maxBufferSize) {}
+                  size_t maxBufferSize = 256 * 1024 * 1024, int64_t syncTimeoutMs = 3000)
+        : io_(std::move(io)), enableCRC_(enableCRC), maxBufferSize_(maxBufferSize),
+          syncTimeoutMs_(syncTimeoutMs) {}
 
     ~MessageStream() {
         close();
@@ -81,29 +91,33 @@ public:
 
     void close() {
         closed_.store(true);
+        syncGeneration_.fetch_add(1);
+        {
+            std::lock_guard<std::mutex> lock(gateMu_);
+        }
+        gateCv_.notify_all(); // 唤醒门控中的发送方，使其以关闭失败
         io_->close();
     }
 
-    // 发送一个完整帧（并发安全）。
+    bool isClosed() const { return closed_.load(); }
+
+    // 发送一个完整帧（并发安全）。协议模式期间门控等待重同步完成（对齐 JS _syncGate）。
     bool send(const uint8_t* data, size_t len) {
-        if (closed_.load()) return false;
         if (len > maxBufferSize_) return false;
-        size_t headerSize = enableCRC_ ? 8 : 4;
-        std::vector<uint8_t> frame(headerSize + len + (enableCRC_ ? 4 : 0));
-        writeLe32(frame.data(), static_cast<uint32_t>(len));
-        if (enableCRC_) writeLe32(frame.data() + 4, crc32(frame.data(), 4));
-        std::memcpy(frame.data() + headerSize, data, len);
-        if (enableCRC_) writeLe32(frame.data() + headerSize + len, crc32(data, len));
-        std::lock_guard<std::mutex> lock(sendMu_);
-        return io_->write(frame.data(), frame.size());
+        {
+            std::unique_lock<std::mutex> lock(gateMu_);
+            gateCv_.wait(lock, [this] { return !protocolMode_.load() || closed_.load(); });
+        }
+        if (closed_.load()) return false;
+        return sendFrame(data, len);
     }
 
     bool send(const std::vector<uint8_t>& data) { return send(data.data(), data.size()); }
 
-    // 错误包（按正常帧封装的 EEEEEEEE+code）
+    // 错误包（按正常帧封装的 EEEEEEEE+code）；不受重同步门控。
     bool sendError(uint8_t code) {
         uint8_t pkt[5] = {0xEE, 0xEE, 0xEE, 0xEE, code};
-        return send(pkt, 5);
+        return sendFrame(pkt, 5);
     }
 
     // 裸协议帧（FFFFFFFF+长度+数据，无 CRC）
@@ -120,18 +134,38 @@ private:
     std::shared_ptr<ByteStream> io_;
     bool enableCRC_;
     size_t maxBufferSize_;
+    int64_t syncTimeoutMs_;
     std::mutex sendMu_;
     std::atomic<bool> started_{false};
     std::atomic<bool> closed_{false};
     std::thread readThread_;
 
-    // 以下状态仅读线程访问
+    // 重同步门控与计时状态（跨线程）
+    std::mutex gateMu_;
+    std::condition_variable gateCv_;
+    std::atomic<bool> protocolMode_{false};
+    std::atomic<uint64_t> syncGeneration_{0}; // 世代号：退出协议模式时递增作废旧计时
+
+    // 以下缓冲状态仅读线程访问
     std::vector<uint8_t> buf_;
     size_t head_ = 0; // 逻辑读游标：消费只前移游标，避免 O(n^2) 头部删除
-    bool protocolMode_ = false;
     long expectedLen_ = -1;
 
-    void emitError(const std::string& msg) { if (onError) onError(msg); }
+    void emitError(const std::string& msg, const std::string& code) {
+        if (onError) onError(StreamError{msg, code});
+    }
+
+    // 直接写帧，不受重同步门控（错误包旁路用）。
+    bool sendFrame(const uint8_t* data, size_t len) {
+        size_t headerSize = enableCRC_ ? 8 : 4;
+        std::vector<uint8_t> frame(headerSize + len + (enableCRC_ ? 4 : 0));
+        writeLe32(frame.data(), static_cast<uint32_t>(len));
+        if (enableCRC_) writeLe32(frame.data() + 4, crc32(frame.data(), 4));
+        std::memcpy(frame.data() + headerSize, data, len);
+        if (enableCRC_) writeLe32(frame.data() + headerSize + len, crc32(data, len));
+        std::lock_guard<std::mutex> lock(sendMu_);
+        return io_->write(frame.data(), frame.size());
+    }
 
     size_t bufLen() const { return buf_.size() - head_; }
     const uint8_t* bufData() const { return buf_.data() + head_; }
@@ -161,9 +195,41 @@ private:
     }
 
     void reset() {
-        protocolMode_ = true;
         clearBuf();
         expectedLen_ = -1;
+        protocolMode_.store(true);
+        uint64_t gen = syncGeneration_.fetch_add(1) + 1;
+        if (syncTimeoutMs_ > 0) {
+            std::weak_ptr<MessageStream> weak = weak_from_this();
+            std::thread([weak, gen] {
+                auto self = weak.lock();
+                if (self) self->syncWatch(gen);
+            }).detach();
+        }
+    }
+
+    // 退出协议模式：作废旧计时并唤醒门控中的发送方。
+    void exitProtocolMode() {
+        protocolMode_.store(false);
+        syncGeneration_.fetch_add(1);
+        {
+            std::lock_guard<std::mutex> lock(gateMu_);
+        }
+        gateCv_.notify_all();
+    }
+
+    // 重同步计时：超时仍未收到 RESET_CONFIRM 则以 ERESYNC_TIMEOUT 断链。
+    void syncWatch(uint64_t gen) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(syncTimeoutMs_));
+        {
+            std::lock_guard<std::mutex> lock(gateMu_);
+            if (gen != syncGeneration_.load() || !protocolMode_.load() || closed_.load()) return;
+            protocolMode_.store(false);
+            syncGeneration_.fetch_add(1);
+        }
+        gateCv_.notify_all();
+        emitError("resync handshake timeout", "ERESYNC_TIMEOUT");
+        close();
     }
 
     void readLoop() {
@@ -175,7 +241,10 @@ private:
                 processBuffer();
             }
             if (n <= 0) {
-                if (!closed_.load()) emitError(n == 0 ? "stream ended" : "stream read error");
+                if (!closed_.load()) {
+                    if (n == 0) emitError("stream ended", "ECLOSED");
+                    else emitError("stream read error", "ESOCKET");
+                }
                 return;
             }
         }
@@ -184,12 +253,12 @@ private:
     void processBuffer() {
         for (;;) {
             if (bufLen() > maxBufferSize_) {
-                emitError("buffer overflow");
+                emitError("buffer overflow", "BUFFER_OVERFLOW");
                 sendError(ERR_BUFFER_OVERFLOW);
                 reset();
                 return;
             }
-            if (protocolMode_) {
+            if (protocolMode_.load()) {
                 // 扫描协议头，而不是整段丢弃（避免误丢 RESET_CONFIRM）
                 ptrdiff_t idx = findProtocolHeader();
                 if (idx >= 0) {
@@ -208,7 +277,7 @@ private:
                     size_t e = text.find_last_not_of(" \t\n\r");
                     std::string trimmed = (b == std::string::npos) ? "" : text.substr(b, e - b + 1);
                     if (trimmed == "RESET_CONFIRM") {
-                        protocolMode_ = false;
+                        exitProtocolMode();
                         clearBuf();
                         if (onSyncComplete) onSyncComplete();
                     }
@@ -228,7 +297,7 @@ private:
                     uint32_t expected = readLe32(bufData() + 4);
                     if (crc32(bufData(), 4) != expected) {
                         sendError(ERR_LENGTH_CRC_FAILED);
-                        emitError("length header CRC check failed");
+                        emitError("length header CRC check failed", "LENGTH_CRC_FAILED");
                         reset();
                         return;
                     }
@@ -238,7 +307,7 @@ private:
                     uint8_t code = static_cast<uint64_t>(length) > maxBufferSize_
                                        ? ERR_BUFFER_OVERFLOW : ERR_LENGTH_CRC_FAILED;
                     sendError(code);
-                    emitError("invalid frame length " + std::to_string(length));
+                    emitError("invalid frame length " + std::to_string(length), "BAD_LENGTH");
                     reset();
                     return;
                 }
@@ -253,7 +322,7 @@ private:
                 uint32_t expected = readLe32(bufData() + expectedLen_);
                 if (crc32(data.data(), data.size()) != expected) {
                     sendError(ERR_MESSAGE_CRC_FAILED);
-                    emitError("message CRC check failed");
+                    emitError("message CRC check failed", "MESSAGE_CRC_FAILED");
                     reset();
                     return;
                 }
@@ -262,13 +331,14 @@ private:
             expectedLen_ = -1;
             // 错误包可能 reset 清空缓冲区，故先消费再分发
             if (data.size() == 5 && data[0] == 0xEE && data[1] == 0xEE && data[2] == 0xEE && data[3] == 0xEE) {
+                emitError("peer reported error packet", "ERESYNC");
                 reset();
                 sendProtocolMessage("RESET_CONFIRM");
-                protocolMode_ = false;
+                exitProtocolMode();
             } else if (onMessage) {
                 onMessage(data);
             }
-            if (protocolMode_) return;
+            if (protocolMode_.load()) return;
         }
     }
 };

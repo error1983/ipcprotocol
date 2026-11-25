@@ -19,12 +19,21 @@ typedef struct {
     const char* code; /* 错误码静态字符串（如 "ETIMEDOUT"），NULL 表示未指定；不需释放 */
 } RpcResult;
 
-/* 接管 ms 所有权；先注册回调再启动读循环 */
+/* 接管 ms 所有权；先注册回调再启动读循环。默认心跳 5s/15s，不鉴权。 */
 RpcProtocol* rpc_create(MessageStream* ms);
+/* heartbeatIntervalMs<=0 关闭心跳；requiredToken 非空时未通过 HELLO 鉴权的请求被拒绝。
+ * authToken 为发起 HELLO 时携带的令牌；requiredToken 为服务端要求的令牌。 */
+RpcProtocol* rpc_create_options(MessageStream* ms, int heartbeatIntervalMs, int heartbeatTimeoutMs,
+                                const char* authToken, const char* requiredToken);
 void rpc_register(RpcProtocol* rpc, const char* name, IpcHandler h, void* user);
 /* 事件回调中 content 为借用，回调返回后释放 */
 void rpc_on_event(RpcProtocol* rpc, void (*cb)(void* user, int contentType, JsonValue* content), void* user);
-void rpc_on_error(RpcProtocol* rpc, void (*cb)(void* user, const char* msg), void* user);
+/* code 为静态错误码字符串（如 "EHEARTBEAT"），可能为 NULL；不需释放 */
+void rpc_on_error(RpcProtocol* rpc, void (*cb)(void* user, const char* msg, const char* code), void* user);
+
+/* 发起 HELLO 握手（版本协商 + 可选鉴权）。timeoutMs<0 用默认超时，0 关闭超时。
+ * 成功返回 value=ACK 对象；ACK error → code="EAUTH"，版本不符 → code="EVERSION"。 */
+RpcResult rpc_hello(RpcProtocol* rpc, int timeoutMs);
 
 /* 默认 RPC 超时（毫秒），对齐 JS 修复版 15s；0 表示关闭。 */
 void rpc_set_default_timeout(RpcProtocol* rpc, int timeoutMs);

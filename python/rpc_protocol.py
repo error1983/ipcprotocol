@@ -18,15 +18,17 @@ import asyncio
 import inspect
 import json
 import struct
+import time
 import uuid
 
 from message_stream import MessageStream
 
-TYPES = {'REQUEST': 0, 'RESPONSE': 1, 'EVENT': 2}
+TYPES = {'REQUEST': 0, 'RESPONSE': 1, 'EVENT': 2, 'PING': 3, 'PONG': 4, 'HELLO': 5, 'HELLO_ACK': 6}
 CONTENT_TYPES = {'TEXT': 0, 'JSON': 1, 'BINARY': 2}
 
 # 默认 RPC 超时（秒），对齐 JS 修复版 DEFAULT_TIMEOUT=15000ms；0 表示关闭
 DEFAULT_TIMEOUT = 15.0
+PROTOCOL_VERSION = 1
 
 
 class RpcError(Exception):
@@ -107,7 +109,9 @@ class RpcProtocol:
     TYPES = TYPES
     CONTENT_TYPES = CONTENT_TYPES
 
-    def __init__(self, message_stream: MessageStream, default_timeout: float = DEFAULT_TIMEOUT):
+    def __init__(self, message_stream: MessageStream, default_timeout: float = DEFAULT_TIMEOUT,
+                 heartbeat_interval: float = 5.0, heartbeat_timeout: float = 15.0,
+                 auth_token: str = None, required_token: str = None):
         if message_stream is None:
             raise ValueError('messageStream is undefined')
         self.message_stream = message_stream
@@ -116,6 +120,17 @@ class RpcProtocol:
         self.pending_requests = {}
         self._listeners = {}
         self._destroyed = False
+
+        # v1.1：心跳与可选 HELLO 握手（PROTOCOL.md §8.1/§8.2，单位秒）
+        self.heartbeat_interval = heartbeat_interval
+        self.heartbeat_timeout = heartbeat_timeout
+        self.auth_token = auth_token
+        self.required_token = required_token
+        self._authenticated = False
+        self._last_received = time.monotonic()
+        self._heartbeat_task = None
+        if heartbeat_interval > 0:
+            self._heartbeat_task = asyncio.get_event_loop().create_task(self._heartbeat_loop())
 
         message_stream.on('message', self._handle_message)
         message_stream.on('error', self._on_stream_error)
@@ -140,13 +155,89 @@ class RpcProtocol:
 
     def _handle_stream_error(self, error):
         message = str(error) or 'Connection error'
+        code = getattr(error, 'code', None)  # 错误码透传（ERESYNC/ERESYNC_TIMEOUT/EHEARTBEAT 等）
         for pending in self.pending_requests.values():
             if not pending.done():
-                pending.set_exception(RpcError(f'Request failed: {message}'))
+                pending.set_exception(RpcError(f'Request failed: {message}', code=code))
         self.pending_requests.clear()
+
+    # ========== 心跳（§8.1） ==========
+    async def _heartbeat_loop(self):
+        try:
+            while not self._destroyed:
+                await asyncio.sleep(self.heartbeat_interval)
+                if self._destroyed:
+                    return
+                silent = time.monotonic() - self._last_received
+                if self.heartbeat_timeout > 0 and silent >= self.heartbeat_timeout:
+                    err = RpcError(f'heartbeat timeout: no data for {int(silent * 1000)}ms',
+                                   code='EHEARTBEAT')
+                    for pending in self.pending_requests.values():
+                        if not pending.done():
+                            pending.set_exception(err)
+                    self.pending_requests.clear()
+                    self._emit('error', err)
+                    await self.destroy()
+                    return
+                if silent >= self.heartbeat_interval:
+                    try:
+                        await self.send_raw(TYPES['PING'], CONTENT_TYPES['TEXT'], str(uuid.uuid4()), '')
+                    except Exception:
+                        pass
+        except asyncio.CancelledError:
+            pass
+
+    # ========== HELLO 握手（§8.2） ==========
+    async def _handle_hello(self, msg_id: str, content):
+        version = content.get('version') if isinstance(content, dict) else None
+        fail = False
+        if version != PROTOCOL_VERSION:
+            ack = {'error': f'unsupported protocol version: {version}'}
+            fail = True
+        elif self.required_token and (not isinstance(content, dict) or content.get('token') != self.required_token):
+            ack = {'error': 'unauthorized'}
+            fail = True
+        else:
+            self._authenticated = True
+            ack = {'version': PROTOCOL_VERSION, 'ok': True}
+        try:
+            await self.send_raw(TYPES['HELLO_ACK'], CONTENT_TYPES['JSON'], msg_id, ack)
+        except Exception:
+            pass
+        if fail:
+            await self.destroy()
+
+    def _handle_hello_ack(self, msg_id: str, content):
+        pending = self.pending_requests.pop(msg_id, None)
+        if pending is None or pending.done():
+            return
+        if isinstance(content, dict) and content.get('error'):
+            pending.set_exception(RpcError(content['error'], code='EAUTH'))
+        elif not isinstance(content, dict) or content.get('version') != PROTOCOL_VERSION:
+            v = content.get('version') if isinstance(content, dict) else None
+            pending.set_exception(RpcError(f'unsupported protocol version: {v}', code='EVERSION'))
+        else:
+            pending.set_result(content)
+
+    async def hello(self, timeout=None):
+        """显式握手：启用鉴权时调用方必须先 await hello() 再发业务请求。"""
+        msg_id = str(uuid.uuid4())
+        future = asyncio.get_event_loop().create_future()
+        self.pending_requests[msg_id] = future
+        payload = {'version': PROTOCOL_VERSION}
+        if self.auth_token:
+            payload['token'] = self.auth_token
+        try:
+            await self.send_raw(TYPES['HELLO'], CONTENT_TYPES['JSON'], msg_id, payload)
+        except Exception as err:
+            self.pending_requests.pop(msg_id, None)
+            if not future.done():
+                future.set_exception(err)
+        return await self._wait_pending(msg_id, future, 'hello', timeout)
 
     # ========== 接收处理 ==========
     def _handle_message(self, buffer: bytes):
+        self._last_received = time.monotonic()  # 任何入站消息都刷新心跳活动时刻
         try:
             msg = deserialize(buffer)
             if msg['type'] not in TYPES.values():
@@ -155,11 +246,24 @@ class RpcProtocol:
                 raise ValueError(f"Invalid content type: {msg['contentType']}")
 
             if msg['type'] == TYPES['REQUEST']:
+                if self.required_token and not self._authenticated:
+                    asyncio.get_event_loop().create_task(self._reject_unauthorized(msg['id']))
+                    return
                 asyncio.get_event_loop().create_task(self._handle_request(msg['id'], msg['content']))
             elif msg['type'] == TYPES['RESPONSE']:
                 self._handle_response(msg['id'], msg['content'])
             elif msg['type'] == TYPES['EVENT']:
+                if self.required_token and not self._authenticated:
+                    return  # 未鉴权事件丢弃
                 self._emit('event', {'contentType': msg['contentType'], 'content': msg['content']})
+            elif msg['type'] == TYPES['PING']:
+                asyncio.get_event_loop().create_task(self._send_pong(msg['id']))
+            elif msg['type'] == TYPES['PONG']:
+                pass  # 仅刷新 _last_received，不交付应用层
+            elif msg['type'] == TYPES['HELLO']:
+                asyncio.get_event_loop().create_task(self._handle_hello(msg['id'], msg['content']))
+            elif msg['type'] == TYPES['HELLO_ACK']:
+                self._handle_hello_ack(msg['id'], msg['content'])
         except Exception as err:
             print(f'Failed to handle message: {err}')
             # 畸形 REQUEST 尽量回错误响应，避免调用方永久等待（对齐 JS 修复版）
@@ -170,6 +274,19 @@ class RpcProtocol:
                         self.send_response(msg_id, {'error': 'Invalid request payload'}))
                 except Exception:
                     pass
+
+    async def _send_pong(self, msg_id: str):
+        try:
+            await self.send_raw(TYPES['PONG'], CONTENT_TYPES['TEXT'], msg_id, '')
+        except Exception:
+            pass
+
+    async def _reject_unauthorized(self, msg_id: str):
+        try:
+            await self.send_response(msg_id, {'error': 'Unauthorized'})
+        except Exception:
+            pass
+        await self.destroy()
 
     async def _handle_request(self, msg_id: str, request):
         try:
@@ -295,6 +412,9 @@ class RpcProtocol:
         if self._destroyed:
             return
         self._destroyed = True
+        if self._heartbeat_task is not None:
+            self._heartbeat_task.cancel()
+            self._heartbeat_task = None
         for pending in self.pending_requests.values():
             if not pending.done():
                 pending.set_exception(RpcError('RPC Protocol destroyed'))

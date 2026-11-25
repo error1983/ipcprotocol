@@ -32,6 +32,14 @@ ERROR_TYPES = {
 ERROR_TYPE_CODES = {v: k for k, v in ERROR_TYPES.items()}
 
 
+class StreamError(Exception):
+    """带错误码的流错误（对齐 JS 修复版 ipcError 的 code 字段）。"""
+
+    def __init__(self, message, code=None):
+        self.code = code
+        super().__init__(message)
+
+
 class MessageStream:
     """基于 asyncio StreamReader/StreamWriter 的消息流，语义对齐 MessageStream.js。
 
@@ -42,13 +50,15 @@ class MessageStream:
     """
 
     def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
-                 enable_crc: bool = True, max_buffer_size: int = 256 * 1024 * 1024):
+                 enable_crc: bool = True, max_buffer_size: int = 256 * 1024 * 1024,
+                 sync_timeout: float = 3.0):
         if reader is None or writer is None:
             raise ValueError('reader/writer is undefined')
         self._reader = reader
         self._writer = writer
         self.enable_crc = enable_crc
         self.max_buffer_size = max_buffer_size
+        self.sync_timeout = sync_timeout  # 重同步握手超时（秒）；<=0 关闭
 
         self._buffer = bytearray()
         self._head = 0  # 逻辑读游标：消费只前移游标，避免 O(n^2) 头部删除
@@ -57,6 +67,9 @@ class MessageStream:
         self._send_lock = asyncio.Lock()
         self._listeners = {}
         self._closed = False
+        self._sync_event = asyncio.Event()  # 发送门控：非协议模式时置位
+        self._sync_event.set()
+        self._sync_task = None
         self._read_task = asyncio.get_event_loop().create_task(self._read_loop())
 
     # ========== 事件 ==========
@@ -72,9 +85,12 @@ class MessageStream:
 
     # ========== 发送 ==========
     async def send(self, data: bytes):
-        """发送一条消息（带长度头与可选 CRC），按调用顺序串行化。"""
+        """发送一条消息（带长度头与可选 CRC），按调用顺序串行化。
+        协议模式期间门控等待重同步完成（对齐 JS _syncGate）。"""
         if len(data) > self.max_buffer_size:
             raise ValueError('Data size exceeds maximum allowed limit')
+        while self._protocol_mode and not self._closed:
+            await self._sync_event.wait()
         async with self._send_lock:
             if self._closed:
                 raise ConnectionError('Stream is not connected')
@@ -92,10 +108,14 @@ class MessageStream:
         return length_header + data
 
     async def send_error(self, error_type: str):
-        """发送错误包（按普通帧格式封装）。"""
+        """发送错误包（按普通帧格式封装）；不受重同步门控。"""
         code = ERROR_TYPES.get(error_type, 0)
         try:
-            await self.send(ERROR_HEADER + bytes([code]))
+            async with self._send_lock:
+                if self._closed:
+                    raise ConnectionError('Stream is not connected')
+                self._writer.write(self._build_frame(ERROR_HEADER + bytes([code])))
+                await self._writer.drain()
         except Exception as err:
             print(f'Failed to send error packet: {err}')
 
@@ -149,16 +169,16 @@ class MessageStream:
                 self._on_data(data)
         except (ConnectionError, OSError) as err:
             if not self._closed:
-                self._emit('error', err)
+                self._emit('error', StreamError(str(err), 'ESOCKET'))
         finally:
             if not self._closed:
-                self._emit('error', ConnectionError('Connection closed'))
+                self._emit('error', StreamError('Connection closed', 'ECLOSED'))
 
     def _on_data(self, data: bytes):
         self._buffer.extend(data)
 
         if self._buf_len() > self.max_buffer_size:
-            self._emit('error', f'Buffer size: {self._buf_len()} exceeds maximum allowed limit')
+            self._emit('error', StreamError(f'Buffer size: {self._buf_len()} exceeds maximum allowed limit', 'BUFFER_OVERFLOW'))
             asyncio.get_event_loop().create_task(self.send_error('BUFFER_OVERFLOW'))
             self.reset()
             return
@@ -199,7 +219,7 @@ class MessageStream:
                     if calculated != expected_crc:
                         print(f'Length header CRC check failed: expected {expected_crc}, got {calculated}')
                         asyncio.get_event_loop().create_task(self.send_error('LENGTH_CRC_FAILED'))
-                        self._emit('error', ValueError('Length header CRC check failed'))
+                        self._emit('error', StreamError('Length header CRC check failed', 'LENGTH_CRC_FAILED'))
                         self.reset()
                         return
 
@@ -207,7 +227,7 @@ class MessageStream:
                 if length == 0 or length > self.max_buffer_size:
                     code = 'BUFFER_OVERFLOW' if length > self.max_buffer_size else 'LENGTH_CRC_FAILED'
                     asyncio.get_event_loop().create_task(self.send_error(code))
-                    self._emit('error', ValueError(f'invalid frame length {length}'))
+                    self._emit('error', StreamError(f'invalid frame length {length}', 'BAD_LENGTH'))
                     self.reset()
                     return
 
@@ -223,7 +243,7 @@ class MessageStream:
                     if calculated != message_crc:
                         print(f'Message CRC check failed: expected {message_crc}, got {calculated}')
                         asyncio.get_event_loop().create_task(self.send_error('MESSAGE_CRC_FAILED'))
-                        self._emit('error', ValueError('Message CRC check failed'))
+                        self._emit('error', StreamError('Message CRC check failed', 'MESSAGE_CRC_FAILED'))
                         self.reset()
                         return
 
@@ -233,10 +253,12 @@ class MessageStream:
                 # 错误包在交给上层之前拦截处理
                 if self._is_error_packet(message_data):
                     code = message_data[4]
-                    print('Received error packet:', ERROR_TYPE_CODES.get(code, 'UNKNOWN_ERROR'))
+                    name = ERROR_TYPE_CODES.get(code, 'UNKNOWN_ERROR')
+                    print('Received error packet:', name)
+                    self._emit('error', StreamError(f'peer reported {name}', 'ERESYNC'))
                     self.reset()
                     asyncio.get_event_loop().create_task(self.send_protocol_message('RESET_CONFIRM'))
-                    self._protocol_mode = False
+                    self._exit_protocol_mode()
                     continue
 
                 self._emit('message', message_data)
@@ -247,12 +269,35 @@ class MessageStream:
         text = message_data.decode('utf8', errors='replace').strip()
         if text == 'RESET_CONFIRM':
             print('Received reset confirmation')
-            self._protocol_mode = False
+            self._exit_protocol_mode()
             self._clear_buffer()
             self._expected_length = None
             self._emit('syncComplete')
             return True
         return False
+
+    def _exit_protocol_mode(self):
+        self._protocol_mode = False
+        self._cancel_sync_watch()
+        self._sync_event.set()
+
+    def _cancel_sync_watch(self):
+        if self._sync_task is not None:
+            self._sync_task.cancel()
+            self._sync_task = None
+
+    async def _sync_watch(self):
+        """重同步握手超时：上报 ERESYNC_TIMEOUT 并断链（对齐 JS syncTimeout）。"""
+        try:
+            await asyncio.sleep(self.sync_timeout)
+        except asyncio.CancelledError:
+            return
+        if not self._protocol_mode or self._closed:
+            return
+        self._sync_task = None  # 避免 _exit_protocol_mode 取消当前任务自身
+        self._exit_protocol_mode()
+        self._emit('error', StreamError('resync handshake timeout', 'ERESYNC_TIMEOUT'))
+        await self.destroy()
 
     @staticmethod
     def _is_error_packet(data: bytes) -> bool:
@@ -264,6 +309,10 @@ class MessageStream:
         self._clear_buffer()
         self._expected_length = None
         self._protocol_mode = True
+        self._sync_event.clear()
+        self._cancel_sync_watch()
+        if self.sync_timeout > 0:
+            self._sync_task = asyncio.get_event_loop().create_task(self._sync_watch())
 
     def get_status(self):
         return {
@@ -277,6 +326,8 @@ class MessageStream:
         if self._closed:
             return
         self._closed = True
+        self._cancel_sync_watch()
+        self._sync_event.set()  # 唤醒门控中的发送方，使其以 ECLOSED 失败
         self._read_task.cancel()
         try:
             self._writer.close()

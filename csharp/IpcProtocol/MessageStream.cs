@@ -14,6 +14,13 @@ using System.Buffers.Binary;
 
 namespace IpcProtocol;
 
+/// <summary>带错误码的流错误（对齐 JS 修复版 ipcError 的 code 字段）。</summary>
+public sealed class StreamException : Exception
+{
+    public string? Code { get; }
+    public StreamException(string message, string? code = null) : base(message) { Code = code; }
+}
+
 public sealed class MessageStream : IDisposable
 {
     private static readonly byte[] ProtocolHeader = { 0xFF, 0xFF, 0xFF, 0xFF };
@@ -42,6 +49,7 @@ public sealed class MessageStream : IDisposable
     private readonly Stream _stream;
     private readonly bool _enableCRC;
     private readonly long _maxBufferSize;
+    private readonly int _syncTimeoutMs;
     // 接收缓冲：byte[] + 头游标，消费只前移游标，避免 O(n^2) 头部删除
     private byte[] _buffer = Array.Empty<byte>();
     private int _head;
@@ -53,12 +61,18 @@ public sealed class MessageStream : IDisposable
     private Task? _readTask;
     private int _started;
     private volatile bool _disposed;
+    // 发送门控：非协议模式时已完成；Reset 时替换为未完成 TCS
+    private TaskCompletionSource _syncGate = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private CancellationTokenSource? _syncCts;
 
-    public MessageStream(Stream stream, bool enableCRC = true, long maxBufferSize = 256L * 1024 * 1024)
+    public MessageStream(Stream stream, bool enableCRC = true, long maxBufferSize = 256L * 1024 * 1024,
+        int syncTimeoutMs = 3000)
     {
         _stream = stream ?? throw new ArgumentNullException(nameof(stream));
         _enableCRC = enableCRC;
         _maxBufferSize = maxBufferSize;
+        _syncTimeoutMs = syncTimeoutMs;  // 重同步握手超时；<=0 关闭
+        _syncGate.SetResult();
     }
 
     /// <summary>启动读循环。幂等；应在挂好监听器之后调用（RpcProtocol 构造时会自动调用），
@@ -71,11 +85,15 @@ public sealed class MessageStream : IDisposable
 
     // ========== 发送 ==========
 
-    /// <summary>发送一条消息（带长度头与可选 CRC），并发调用按序串行化。</summary>
+    /// <summary>发送一条消息（带长度头与可选 CRC），并发调用按序串行化。
+    /// 协议模式期间门控等待重同步完成（对齐 JS _syncGate）。</summary>
     public async Task SendAsync(byte[] data)
     {
         if (data.Length > _maxBufferSize)
             throw new InvalidOperationException("Data size exceeds maximum allowed limit");
+
+        while (_protocolMode && !_disposed)
+            await _syncGate.Task.ConfigureAwait(false);
 
         await _sendLock.WaitAsync().ConfigureAwait(false);
         try
@@ -110,14 +128,25 @@ public sealed class MessageStream : IDisposable
         return result;
     }
 
-    /// <summary>发送错误包（按普通帧格式封装）。</summary>
+    /// <summary>发送错误包（按普通帧格式封装）；不受重同步门控。</summary>
     public async Task SendErrorAsync(string errorType)
     {
         var code = ErrorTypes.GetValueOrDefault(errorType, (byte)0);
         var errorData = new byte[] { 0xEE, 0xEE, 0xEE, 0xEE, code };
         try
         {
-            await SendAsync(errorData).ConfigureAwait(false);
+            await _sendLock.WaitAsync().ConfigureAwait(false);
+            try
+            {
+                if (_disposed) throw new IOException("Stream is not connected");
+                var frame = BuildFrame(errorData);
+                await _stream.WriteAsync(frame).ConfigureAwait(false);
+                await _stream.FlushAsync().ConfigureAwait(false);
+            }
+            finally
+            {
+                _sendLock.Release();
+            }
         }
         catch (Exception err)
         {
@@ -216,9 +245,9 @@ public sealed class MessageStream : IDisposable
         catch (OperationCanceledException) { return; }
         catch (Exception err)
         {
-            if (!_disposed) Error?.Invoke(err);
+            if (!_disposed) Error?.Invoke(new StreamException(err.Message, "ESOCKET"));
         }
-        if (!_disposed) Error?.Invoke(new IOException("Connection closed"));
+        if (!_disposed) Error?.Invoke(new StreamException("Connection closed", "ECLOSED"));
     }
 
     private void OnData(ReadOnlySpan<byte> data)
@@ -227,7 +256,7 @@ public sealed class MessageStream : IDisposable
 
         if (_count > _maxBufferSize)
         {
-            Error?.Invoke(new InvalidOperationException($"Buffer size: {_count} exceeds maximum allowed limit"));
+            Error?.Invoke(new StreamException($"Buffer size: {_count} exceeds maximum allowed limit", "BUFFER_OVERFLOW"));
             _ = SendErrorAsync("BUFFER_OVERFLOW");
             Reset();
             return;
@@ -275,7 +304,7 @@ public sealed class MessageStream : IDisposable
                     {
                         Console.Error.WriteLine($"Length header CRC check failed: expected {expectedCRC}, got {calculated}");
                         _ = SendErrorAsync("LENGTH_CRC_FAILED");
-                        Error?.Invoke(new InvalidDataException("Length header CRC check failed"));
+                        Error?.Invoke(new StreamException("Length header CRC check failed", "LENGTH_CRC_FAILED"));
                         Reset();
                         return;
                     }
@@ -286,7 +315,7 @@ public sealed class MessageStream : IDisposable
                 {
                     string code = length > (ulong)_maxBufferSize ? "BUFFER_OVERFLOW" : "LENGTH_CRC_FAILED";
                     _ = SendErrorAsync(code);
-                    Error?.Invoke(new InvalidDataException($"invalid frame length {length}"));
+                    Error?.Invoke(new StreamException($"invalid frame length {length}", "BAD_LENGTH"));
                     Reset();
                     return;
                 }
@@ -308,7 +337,7 @@ public sealed class MessageStream : IDisposable
                     {
                         Console.Error.WriteLine($"Message CRC check failed: expected {messageCRC}, got {calculated}");
                         _ = SendErrorAsync("MESSAGE_CRC_FAILED");
-                        Error?.Invoke(new InvalidDataException("Message CRC check failed"));
+                        Error?.Invoke(new StreamException("Message CRC check failed", "MESSAGE_CRC_FAILED"));
                         Reset();
                         return;
                     }
@@ -322,9 +351,10 @@ public sealed class MessageStream : IDisposable
                 {
                     var name = ErrorTypeCodes.GetValueOrDefault(messageData[4], "UNKNOWN_ERROR");
                     Console.WriteLine($"Received error packet: {name}");
+                    Error?.Invoke(new StreamException($"peer reported {name}", "ERESYNC"));
                     Reset();
                     _ = SendProtocolMessageAsync("RESET_CONFIRM");
-                    _protocolMode = false;
+                    ExitProtocolMode();
                     continue;
                 }
 
@@ -340,11 +370,29 @@ public sealed class MessageStream : IDisposable
         if (text == "RESET_CONFIRM")
         {
             Console.WriteLine("Received reset confirmation");
-            _protocolMode = false;
+            ExitProtocolMode();
             ClearBuffer();
             _expectedLength = null;
             SyncComplete?.Invoke();
         }
+    }
+
+    private void ExitProtocolMode()
+    {
+        _protocolMode = false;
+        _syncCts?.Cancel();
+        _syncCts = null;
+        _syncGate.TrySetResult();
+    }
+
+    private async Task SyncWatchAsync(CancellationToken ct)
+    {
+        try { await Task.Delay(_syncTimeoutMs, ct).ConfigureAwait(false); }
+        catch (OperationCanceledException) { return; }
+        if (!_protocolMode || _disposed) return;
+        ExitProtocolMode();
+        Error?.Invoke(new StreamException("resync handshake timeout", "ERESYNC_TIMEOUT"));
+        Dispose();
     }
 
     private static bool IsErrorPacket(byte[] data)
@@ -357,6 +405,14 @@ public sealed class MessageStream : IDisposable
         ClearBuffer();
         _expectedLength = null;
         _protocolMode = true;
+        _syncGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _syncCts?.Cancel();
+        _syncCts = null;
+        if (_syncTimeoutMs > 0)
+        {
+            _syncCts = new CancellationTokenSource();
+            _ = SyncWatchAsync(_syncCts.Token);
+        }
     }
 
     public object GetStatus() => new
@@ -371,6 +427,8 @@ public sealed class MessageStream : IDisposable
     {
         if (_disposed) return;
         _disposed = true;
+        _syncCts?.Cancel();
+        _syncGate.TrySetResult();  // 唤醒门控中的发送方，使其以 ECLOSED 失败
         _cts.Cancel();
         try { _stream.Dispose(); } catch { /* ignore */ }
         ClearBuffer();

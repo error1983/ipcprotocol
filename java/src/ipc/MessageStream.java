@@ -31,6 +31,13 @@ import java.util.zip.CRC32;
  */
 public class MessageStream implements Closeable {
 
+    /** 带错误码的流错误（对齐 JS 修复版 ipcError 的 code 字段）。 */
+    public static class StreamException extends IOException {
+        private final String code;
+        public StreamException(String message, String code) { super(message); this.code = code; }
+        public String getCode() { return code; }
+    }
+
     public interface MessageListener { void onMessage(byte[] data); }
     public interface ErrorListener { void onError(Exception err); }
     public interface SyncCompleteListener { void onSyncComplete(); }
@@ -53,12 +60,14 @@ public class MessageStream implements Closeable {
     private final OutputStream out;
     private final boolean enableCRC;
     private final long maxBufferSize;
+    private final long syncTimeoutMs;
 
     private byte[] buffer = new byte[0];
     private int head = 0;   // 逻辑读游标：消费只前移游标，避免 O(n^2) 全量复制
     private int count = 0;
     private Integer expectedLength = null;
     private boolean protocolMode = false;
+    private int syncGeneration = 0;   // 重同步计时世代号，退出协议模式时递增作废旧计时
 
     private final Object sendLock = new Object();
     private volatile boolean closed = false;
@@ -74,11 +83,16 @@ public class MessageStream implements Closeable {
     }
 
     public MessageStream(InputStream in, OutputStream out, boolean enableCRC, long maxBufferSize) {
+        this(in, out, enableCRC, maxBufferSize, 3000);
+    }
+
+    public MessageStream(InputStream in, OutputStream out, boolean enableCRC, long maxBufferSize, long syncTimeoutMs) {
         if (in == null || out == null) throw new IllegalArgumentException("stream is undefined");
         this.in = in;
         this.out = out;
         this.enableCRC = enableCRC;
         this.maxBufferSize = maxBufferSize;
+        this.syncTimeoutMs = syncTimeoutMs;  // 重同步握手超时；<=0 关闭
     }
 
     /** 启动读循环。幂等；应在挂好监听器之后调用（RpcProtocol 构造时会自动调用）。 */
@@ -95,6 +109,9 @@ public class MessageStream implements Closeable {
     public void addMessageListener(MessageListener l) { synchronized (messageListeners) { messageListeners.add(l); } }
     public void addErrorListener(ErrorListener l) { synchronized (errorListeners) { errorListeners.add(l); } }
     public void addSyncCompleteListener(SyncCompleteListener l) { synchronized (syncListeners) { syncListeners.add(l); } }
+
+    /** 流是否已关闭。 */
+    public boolean isClosed() { return closed; }
 
     private void emitMessage(byte[] data) {
         List<MessageListener> copy;
@@ -122,10 +139,17 @@ public class MessageStream implements Closeable {
 
     // ========== 发送 ==========
 
-    /** 发送一条消息（带长度头与可选 CRC），并发调用按序串行化。 */
+    /** 发送一条消息（带长度头与可选 CRC），并发调用按序串行化。
+     * 协议模式期间门控等待重同步完成（对齐 JS _syncGate）。 */
     public void send(byte[] data) throws IOException {
         if (data.length > maxBufferSize)
             throw new IOException("Data size exceeds maximum allowed limit");
+        synchronized (this) {
+            while (protocolMode && !closed) {
+                try { wait(); }
+                catch (InterruptedException e) { Thread.currentThread().interrupt(); throw new IOException("send interrupted"); }
+            }
+        }
         synchronized (sendLock) {
             if (closed) throw new IOException("Stream is not connected");
             out.write(buildFrame(data));
@@ -149,12 +173,16 @@ public class MessageStream implements Closeable {
         return frame;
     }
 
-    /** 发送错误包（按普通帧格式封装）。 */
+    /** 发送错误包（按普通帧格式封装）；不受重同步门控。 */
     public void sendError(String errorType) {
         int code = ERROR_TYPES.getOrDefault(errorType, 0);
         byte[] errorData = new byte[] { (byte) 0xEE, (byte) 0xEE, (byte) 0xEE, (byte) 0xEE, (byte) code };
         try {
-            send(errorData);
+            synchronized (sendLock) {
+                if (closed) throw new IOException("Stream is not connected");
+                out.write(buildFrame(errorData));
+                out.flush();
+            }
         } catch (IOException err) {
             System.err.println("Failed to send error packet: " + err.getMessage());
         }
@@ -232,16 +260,16 @@ public class MessageStream implements Closeable {
                 }
             }
         } catch (IOException err) {
-            if (!closed) emitError(err);
+            if (!closed) emitError(new StreamException(err.getMessage(), "ESOCKET"));
         }
-        if (!closed) emitError(new IOException("Connection closed"));
+        if (!closed) emitError(new StreamException("Connection closed", "ECLOSED"));
     }
 
     private void onData(byte[] data, int n) {
         append(data, n);
 
         if (bufLen() > maxBufferSize) {
-            emitError(new IOException("Buffer size: " + bufLen() + " exceeds maximum allowed limit"));
+            emitError(new StreamException("Buffer size: " + bufLen() + " exceeds maximum allowed limit", "BUFFER_OVERFLOW"));
             sendError("BUFFER_OVERFLOW");
             reset();
             return;
@@ -282,7 +310,7 @@ public class MessageStream implements Closeable {
                     if (calculated != expectedCRC) {
                         System.err.println("Length header CRC check failed: expected " + expectedCRC + ", got " + calculated);
                         sendError("LENGTH_CRC_FAILED");
-                        emitError(new IOException("Length header CRC check failed"));
+                        emitError(new StreamException("Length header CRC check failed", "LENGTH_CRC_FAILED"));
                         reset();
                         return;
                     }
@@ -292,7 +320,7 @@ public class MessageStream implements Closeable {
                 if (length == 0 || length > maxBufferSize) {
                     String code = length > maxBufferSize ? "BUFFER_OVERFLOW" : "LENGTH_CRC_FAILED";
                     sendError(code);
-                    emitError(new IOException("invalid frame length " + length));
+                    emitError(new StreamException("invalid frame length " + length, "BAD_LENGTH"));
                     reset();
                     return;
                 }
@@ -310,7 +338,7 @@ public class MessageStream implements Closeable {
                     if (calculated != messageCRC) {
                         System.err.println("Message CRC check failed: expected " + messageCRC + ", got " + calculated);
                         sendError("MESSAGE_CRC_FAILED");
-                        emitError(new IOException("Message CRC check failed"));
+                        emitError(new StreamException("Message CRC check failed", "MESSAGE_CRC_FAILED"));
                         reset();
                         return;
                     }
@@ -323,9 +351,10 @@ public class MessageStream implements Closeable {
                 if (isErrorPacket(messageData)) {
                     String name = ERROR_TYPE_CODES.getOrDefault(messageData[4] & 0xFF, "UNKNOWN_ERROR");
                     System.out.println("Received error packet: " + name);
+                    emitError(new StreamException("peer reported " + name, "ERESYNC"));
                     reset();
                     sendProtocolMessage("RESET_CONFIRM");
-                    protocolMode = false;
+                    exitProtocolMode();
                     continue;
                 }
 
@@ -340,11 +369,29 @@ public class MessageStream implements Closeable {
         String text = new String(messageData, StandardCharsets.UTF_8).trim();
         if ("RESET_CONFIRM".equals(text)) {
             System.out.println("Received reset confirmation");
-            protocolMode = false;
+            exitProtocolMode();
             clearBuffer();
             expectedLength = null;
             emitSyncComplete();
         }
+    }
+
+    /** 退出协议模式：作废旧计时并唤醒门控中的发送方。调用方需持有 this  monitor。 */
+    private void exitProtocolMode() {
+        protocolMode = false;
+        syncGeneration++;
+        notifyAll();
+    }
+
+    private void syncWatch(int gen) {
+        try { Thread.sleep(syncTimeoutMs); }
+        catch (InterruptedException e) { return; }
+        synchronized (this) {
+            if (gen != syncGeneration || !protocolMode || closed) return;
+            exitProtocolMode();
+        }
+        emitError(new StreamException("resync handshake timeout", "ERESYNC_TIMEOUT"));
+        close();
     }
 
     private static boolean isErrorPacket(byte[] data) {
@@ -357,12 +404,22 @@ public class MessageStream implements Closeable {
         clearBuffer();
         expectedLength = null;
         protocolMode = true;
+        final int gen = ++syncGeneration;
+        if (syncTimeoutMs > 0) {
+            Thread t = new Thread(() -> syncWatch(gen), "MessageStream-syncwatch");
+            t.setDaemon(true);
+            t.start();
+        }
     }
 
     @Override
     public void close() {
         if (closed) return;
         closed = true;
+        synchronized (this) {
+            syncGeneration++;
+            notifyAll();  // 唤醒门控中的发送方，使其以 ECLOSED 失败
+        }
         try { in.close(); } catch (IOException ignored) {}
         try { out.close(); } catch (IOException ignored) {}
         synchronized (this) {

@@ -11,19 +11,27 @@ import (
 	"math"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
-// 消息类型与载荷类型（与 JS 版一致）。
+// 消息类型与载荷类型（与 JS 版一致，v1.1 新增 3-6）。
 const (
 	TypeRequest  = 0
 	TypeResponse = 1
 	TypeEvent    = 2
+	TypePing     = 3
+	TypePong     = 4
+	TypeHello    = 5
+	TypeHelloAck = 6
 
 	ContentText   = 0
 	ContentJSON   = 1
 	ContentBinary = 2
 )
+
+// ProtocolVersion 线协议版本（HELLO 协商用）。
+const ProtocolVersion = 1
 
 // Handler 服务端方法处理器；args 为展开后的参数，返回值决定响应类型。
 type Handler func(args []any) (any, error)
@@ -53,6 +61,15 @@ type RpcProtocol struct {
 	// DefaultTimeout 默认 RPC 超时，对齐 JS 修复版 15s；0 表示关闭。可在构造后修改。
 	DefaultTimeout time.Duration
 
+	// ---- v1.1: 心跳与 HELLO 握手（PROTOCOL.md §8.1/§8.2） ----
+	HeartbeatInterval time.Duration // <=0 关闭心跳
+	HeartbeatTimeout  time.Duration // 静默超时，EHEARTBEAT 断链；<=0 关闭
+	AuthToken         string        // 客户端 HELLO 携带的令牌
+	RequiredToken     string        // 服务端要求的令牌；非空时未鉴权请求被拒绝
+	lastReceived      atomic.Int64  // 最后入站消息时刻（UnixMilli）
+	authenticated     atomic.Bool
+	hbStop            chan struct{}
+
 	closeOnce sync.Once
 }
 
@@ -61,18 +78,62 @@ type rpcResult struct {
 	err   error
 }
 
-// NewRpcProtocol 包装消息流；先注册回调再启动读循环，避免早到消息丢失。
+// NewRpcProtocol 包装消息流（默认心跳 5s/15s，不鉴权）；先注册回调再启动读循环，避免早到消息丢失。
 func NewRpcProtocol(ms *MessageStream) *RpcProtocol {
+	return NewRpcProtocolOptions(ms, 5*time.Second, 15*time.Second, "", "")
+}
+
+// NewRpcProtocolOptions 带心跳与鉴权配置的构造。
+func NewRpcProtocolOptions(ms *MessageStream, heartbeatInterval, heartbeatTimeout time.Duration, authToken, requiredToken string) *RpcProtocol {
 	rpc := &RpcProtocol{
-		ms:             ms,
-		handlers:       make(map[string]Handler),
-		pending:        make(map[string]chan rpcResult),
-		DefaultTimeout: 15 * time.Second,
+		ms:                ms,
+		handlers:          make(map[string]Handler),
+		pending:           make(map[string]chan rpcResult),
+		DefaultTimeout:    15 * time.Second,
+		HeartbeatInterval: heartbeatInterval,
+		HeartbeatTimeout:  heartbeatTimeout,
+		AuthToken:         authToken,
+		RequiredToken:     requiredToken,
 	}
+	rpc.authenticated.Store(requiredToken == "")
+	rpc.lastReceived.Store(time.Now().UnixMilli())
 	ms.OnMessage = rpc.handleMessage
 	ms.OnError = rpc.handleStreamError
 	ms.Start()
+	if heartbeatInterval > 0 {
+		rpc.hbStop = make(chan struct{})
+		go rpc.heartbeatLoop()
+	}
 	return rpc
+}
+
+// heartbeatLoop 心跳节拍：静默超过 timeout 以 EHEARTBEAT 结算全部 pending 并断链；否则按间隔发 PING。
+func (rpc *RpcProtocol) heartbeatLoop() {
+	ticker := time.NewTicker(rpc.HeartbeatInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-rpc.hbStop:
+			return
+		case <-ticker.C:
+			silent := time.Since(time.UnixMilli(rpc.lastReceived.Load()))
+			if rpc.HeartbeatTimeout > 0 && silent >= rpc.HeartbeatTimeout {
+				err := &RpcError{
+					Value: fmt.Sprintf("heartbeat timeout: no data for %dms", silent.Milliseconds()),
+					Code:  "EHEARTBEAT",
+				}
+				rpc.rejectAll(err)
+				if rpc.OnError != nil {
+					rpc.OnError(err)
+				}
+				rpc.Close()
+				return
+			}
+			if silent >= rpc.HeartbeatInterval {
+				_ = rpc.ms.Send(buildMessage(TypePing, ContentText, newUUID(), nil))
+			}
+		}
+	}
 }
 
 // RegisterMethod 注册服务端方法。
@@ -184,6 +245,9 @@ func (rpc *RpcProtocol) SendBinary(data []byte) error {
 // Close 销毁：拒绝所有 pending 并关闭流。
 func (rpc *RpcProtocol) Close() {
 	rpc.closeOnce.Do(func() {
+		if rpc.hbStop != nil {
+			close(rpc.hbStop)
+		}
 		rpc.rejectAll(errors.New("RPC Protocol destroyed"))
 		rpc.ms.Close()
 	})
@@ -213,7 +277,12 @@ func (rpc *RpcProtocol) rejectAll(err error) {
 }
 
 func (rpc *RpcProtocol) handleStreamError(err error) {
-	rpc.rejectAll(fmt.Errorf("Request failed: %w", err))
+	var se *StreamError
+	if errors.As(err, &se) {
+		rpc.rejectAll(&RpcError{Value: "Request failed: " + se.Message, Code: se.Code})
+	} else {
+		rpc.rejectAll(fmt.Errorf("Request failed: %w", err))
+	}
 	if rpc.OnError != nil {
 		rpc.OnError(err)
 	}
@@ -226,8 +295,13 @@ func (rpc *RpcProtocol) handleMessage(data []byte) {
 	}
 	msgType := int(data[0])
 	contentType := int(data[1])
+	if msgType < 0 || msgType > 6 {
+		log.Printf("[ipc] invalid message type: %d", msgType)
+		return
+	}
 	id := bytesToUUID(data[2:18])
 	payload := data[18:]
+	rpc.lastReceived.Store(time.Now().UnixMilli()) // 任何入站消息都刷新心跳基准
 
 	content, err := deserialize(contentType, payload)
 	if err != nil {
@@ -241,6 +315,11 @@ func (rpc *RpcProtocol) handleMessage(data []byte) {
 
 	switch msgType {
 	case TypeRequest:
+		if !rpc.authenticated.Load() {
+			rpc.sendErrorResponse(id, "Unauthorized")
+			rpc.Close()
+			return
+		}
 		go rpc.handleRequest(id, contentType, content, payload)
 	case TypeResponse:
 		if ch := rpc.takePending(id); ch != nil {
@@ -253,10 +332,93 @@ func (rpc *RpcProtocol) handleMessage(data []byte) {
 			ch <- rpcResult{value: content}
 		}
 	case TypeEvent:
+		if !rpc.authenticated.Load() {
+			return // 未鉴权事件直接丢弃
+		}
 		if rpc.OnEvent != nil {
 			rpc.OnEvent(contentType, content)
 		}
+	case TypePing:
+		_ = rpc.ms.Send(buildMessage(TypePong, ContentText, id, nil))
+	case TypePong:
+		// 仅刷新 lastReceived（上面已做）
+	case TypeHello:
+		rpc.handleHello(id, content)
+	case TypeHelloAck:
+		rpc.handleHelloAck(id, content)
 	}
+}
+
+// ---- v1.1: HELLO 握手 ----
+
+func (rpc *RpcProtocol) handleHello(id string, content any) {
+	ack := map[string]any{"version": float64(ProtocolVersion)}
+	ok := false
+	if m, isMap := content.(map[string]any); isMap {
+		version, _ := m["version"].(float64)
+		if version != ProtocolVersion {
+			ack["error"] = "Unsupported protocol version"
+		} else if rpc.RequiredToken != "" && m["token"] != rpc.RequiredToken {
+			ack["error"] = "Unauthorized"
+		} else {
+			rpc.authenticated.Store(true)
+			ack["ok"] = true
+			ok = true
+		}
+	} else {
+		ack["error"] = "Invalid hello payload"
+	}
+	body, _ := json.Marshal(ack)
+	_ = rpc.ms.Send(buildMessage(TypeHelloAck, ContentJSON, id, body))
+	if !ok {
+		rpc.Close() // 握手失败后服务端断链
+	}
+}
+
+func (rpc *RpcProtocol) handleHelloAck(id string, content any) {
+	ch := rpc.takePending(id)
+	if ch == nil {
+		return
+	}
+	m, ok := content.(map[string]any)
+	if !ok {
+		ch <- rpcResult{err: &RpcError{Value: "Invalid hello ack payload", Code: "EAUTH"}}
+		return
+	}
+	if ev, exists := m["error"]; exists && isTruthy(ev) {
+		ch <- rpcResult{err: &RpcError{Value: ev, Code: "EAUTH"}}
+		return
+	}
+	if version, _ := m["version"].(float64); version != ProtocolVersion {
+		ch <- rpcResult{err: &RpcError{Value: "Unsupported protocol version", Code: "EVERSION"}}
+		return
+	}
+	ch <- rpcResult{value: content}
+}
+
+// Hello 发起 HELLO 握手（默认超时）；ACK error → EAUTH，版本不符 → EVERSION。
+func (rpc *RpcProtocol) Hello() (any, error) {
+	return rpc.HelloTimeout(rpc.DefaultTimeout)
+}
+
+// HelloTimeout 带显式超时的 HELLO 握手；0 关闭超时。
+func (rpc *RpcProtocol) HelloTimeout(timeout time.Duration) (any, error) {
+	id := newUUID()
+	ch := make(chan rpcResult, 1)
+	rpc.pendingMu.Lock()
+	rpc.pending[id] = ch
+	rpc.pendingMu.Unlock()
+
+	payload := map[string]any{"version": float64(ProtocolVersion)}
+	if rpc.AuthToken != "" {
+		payload["token"] = rpc.AuthToken
+	}
+	body, _ := json.Marshal(payload)
+	if err := rpc.ms.Send(buildMessage(TypeHello, ContentJSON, id, body)); err != nil {
+		rpc.removePending(id)
+		return nil, err
+	}
+	return rpc.waitResult(id, ch, "hello", timeout)
 }
 
 func (rpc *RpcProtocol) sendErrorResponse(id, msg string) {

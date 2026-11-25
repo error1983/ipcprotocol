@@ -215,4 +215,51 @@ C 的超时/响应竞态处理：`wait_pending` 超时后先 `pending_take(id)` 
 
 ### 8.5 仍未覆盖的 P0/P1 项
 
-心跳/keepalive（半开连接检测）、3s 重同步超时断链 + `ERESYNC`、鉴权与版本协商仍缺，见生产评估结论。
+~~心跳/keepalive（半开连接检测）、3s 重同步超时断链 + `ERESYNC`、鉴权与版本协商仍缺~~
+**已在下一轮（§九）全部补齐**：协议升级 1.1，八语言统一落地心跳 PING/PONG、可选 HELLO 握手（鉴权 + 版本协商）、3s 重同步超时断链。
+
+## 九、协议 1.1：心跳、HELLO 握手与重同步超时（本轮新增）
+
+补齐 §8.5 所列三项 P0/P1。`PROTOCOL.md` 升级 **1.1** 作为事实标准；**18B 消息头与帧线格式不变**，新增消息类型 3–6，旧调用方源码兼容（心跳/握手默认不强制）。
+
+### 9.1 规格要点（PROTOCOL.md §4.5 / §8.1 / §8.2）
+
+- **消息类型**：`0=REQUEST,1=RESPONSE,2=EVENT,3=PING,4=PONG,5=HELLO,6=HELLO_ACK`。
+- **心跳（§8.1）**：默认 interval 5000ms / timeout 15000ms（interval≤0 关闭）。任何入站消息刷新 `lastReceived`；静默≥timeout 以 **`EHEARTBEAT`** 结算全部 pending 并断链；静默≥interval 发 PING；收到 PING 立即回 PONG（回显 id）。PING/PONG 为 TEXT 空载荷，不受鉴权门禁。
+- **HELLO 握手（§8.2）**：客户端发 `{"version":1,"token":?}`，服务端回 `{"version":1,"ok":true}` 或 `{"error":...}`；失败后服务端断链。`requiredToken` 非空时启用门禁：未鉴权 REQUEST 回 `{"error":"Unauthorized"}` 后断链，EVENT 丢弃。ACK error → **`EAUTH`**，版本不符 → **`EVERSION`**。
+- **重同步超时（§4.5）**：`syncTimeout` 默认 3000ms（≤0 关闭）。进协议模式启动计时，RESET_CONFIRM/close 以世代号作废旧计时；超时以 **`ERESYNC_TIMEOUT`** 断链。协议模式下业务 send 门控等待，错误包/协议消息旁路门控（防自锁）；流错误（含 `ERESYNC`、CRC 失败）结算全部 pending 并透传 code。
+
+### 9.2 各语言实现手法
+
+| 语言 | 门控/计时原语 | 心跳载体 | 错误码载体 |
+|---|---|---|---|
+| JS | 发送队列 + 重同步 Promise | RpcProtocol 定时器 | `RpcError.code` / stream error code |
+| Python | `asyncio` 门控 + 计时任务 | asyncio task | `RpcError.code` |
+| C# | 门控 + `CancellationToken` 计时 | `Task` 心跳循环 | `RpcException.Code` |
+| Java | `wait/notify` + `syncGeneration` | 守护线程节拍 | `RpcException.getCode()` |
+| Go | `sync.Cond` + `AtomicU64` 世代 | goroutine 心跳 | `RpcError.Code` |
+| Rust | `Condvar` + `AtomicU64` + detached 线程（`Weak` 防悬垂） | 心跳线程 | `RpcError::Coded{code}` |
+| C++ | `condition_variable` + atomic 世代 + `enable_shared_from_this`/`weak_ptr` | 心跳线程 | `RpcException.code` / `StreamError` |
+| C | `pthread_mutex`/`pthread_cond_timedwait` + 世代号 + `sync_watchers` 计数防 use-after-free | pthread 心跳线程 | `RpcResult.code` / `ms_on_error` code 参 |
+
+C 的 `ms_destroy` 等读线程与全部重同步计时线程退出后再释放；`rpc_destroy` 先 close 唤醒心跳线程再 join，杜绝悬垂与双重释放。
+
+### 9.3 复测结果（Windows / 回环 TCP）
+
+| 语言 | 回环测试（含 v1.1 心跳/HELLO/重同步超时用例） |
+|---|---|
+| JS | 13/13（`node test_v11.js`） |
+| Python | 27/27 |
+| C# | 25/25 |
+| Java | 28/28（`-encoding UTF-8` 零警告） |
+| Go | `go test -count=1 -race ./...` 全部 ok |
+| Rust | 15/15 |
+| C++ | 32/32 |
+| C | 30/30（重复 3 次稳定，example 编译通过） |
+
+各语言 v1.1 用例统一覆盖：HELLO 成功/错误 token（EAUTH）/未鉴权请求（Unauthorized）/版本不匹配（EVERSION）、心跳保活、心跳超时（EHEARTBEAT 结算 pending + 断链）、重同步超时（ERESYNC_TIMEOUT 断链）。坏帧/静默对端构造：坏帧对端发 `le32(5)+le32(0xDEADBEEF)+"hello"+crc` 后静默；重同步计时 300ms、等待 500ms 断言。
+
+### 9.4 互操作冒烟（线格式零回归）
+
+- Python↔Node：12/12（含 CRC 损坏注入→重同步→RPC 恢复）。
+- C 客户端→Node 服务端：11/11；Node 客户端→C 服务端：10/10。

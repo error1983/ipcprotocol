@@ -97,7 +97,7 @@ static JsonValue* h_slow(void* u, JsonValue** a, size_t n, char** err) {
     return json_str("late");
 }
 
-static void silent_error(void* u, const char* msg) { (void)u; (void)msg; }
+static void silent_error(void* u, const char* msg, const char* code) { (void)u; (void)msg; (void)code; }
 
 static void on_sync(void* u) {
     TestServer* s = (TestServer*)u;
@@ -151,6 +151,127 @@ static void stop_server(TestServer* s) {
     tcp_conn_free(s->conn);
     tcp_listener_free(s->ln);
     free(s);
+}
+
+/* ---- v1.1 测试辅助 ---- */
+
+typedef struct {
+    TcpListener* ln;
+    RpcProtocol* rpc;
+    TcpConn* conn;
+    volatile int ready;
+    int hbInterval, hbTimeout;
+    const char* requiredToken;
+} OptsServer;
+
+static void* opts_server_thread(void* arg) {
+    OptsServer* s = (OptsServer*)arg;
+    s->conn = tcp_accept(s->ln);
+    MessageStream* ms = ms_create(tcp_io(s->conn), 1, 0);
+    s->rpc = rpc_create_options(ms, s->hbInterval, s->hbTimeout, NULL, s->requiredToken);
+    rpc_on_error(s->rpc, silent_error, NULL);
+    rpc_register(s->rpc, "add", h_add, NULL);
+    s->ready = 1;
+    return NULL;
+}
+
+static OptsServer* start_opts(int hbI, int hbT, const char* reqTok) {
+    OptsServer* s = (OptsServer*)calloc(1, sizeof(OptsServer));
+    s->ln = tcp_listen("127.0.0.1", 0);
+    s->hbInterval = hbI; s->hbTimeout = hbT; s->requiredToken = reqTok;
+    pthread_t t;
+    pthread_create(&t, NULL, opts_server_thread, s);
+    pthread_detach(t);
+    return s;
+}
+
+static RpcProtocol* dial_opts(OptsServer* s, TcpConn** connOut, int hbI, int hbT, const char* authTok) {
+    TcpConn* conn = tcp_connect("127.0.0.1", tcp_listener_port(s->ln));
+    wait_flag(&s->ready);
+    *connOut = conn;
+    RpcProtocol* rpc = rpc_create_options(ms_create(tcp_io(conn), 1, 0), hbI, hbT, authTok, NULL);
+    rpc_on_error(rpc, silent_error, NULL);
+    return rpc;
+}
+
+static void stop_opts(OptsServer* s) {
+    if (s->rpc) rpc_destroy(s->rpc);
+    tcp_conn_free(s->conn);
+    tcp_listener_free(s->ln);
+    free(s);
+}
+
+/* 裸对端：mode 0=静默，1=坏帧后静默，2=回 HELLO_ACK version=99 */
+typedef struct { TcpListener* ln; int mode; } PeerArg;
+typedef struct { MessageStream* ms; } VersionPeer;
+
+static void version_on_msg(void* u, const unsigned char* data, size_t len) {
+    VersionPeer* vp = (VersionPeer*)u;
+    if (len < 18) return;
+    const char* body = "{\"version\":99,\"ok\":true}";
+    size_t bl = strlen(body);
+    unsigned char* msg = (unsigned char*)malloc(18 + bl);
+    msg[0] = 6; /* TYPE_HELLO_ACK */
+    msg[1] = 1; /* CONTENT_JSON */
+    memcpy(msg + 2, data + 2, 16); /* 回显请求 id */
+    memcpy(msg + 18, body, bl);
+    ms_send(vp->ms, msg, 18 + bl);
+    free(msg);
+}
+
+static void* peer_thread(void* arg) {
+    PeerArg* pa = (PeerArg*)arg;
+    TcpConn* conn = tcp_accept(pa->ln);
+    if (pa->mode == 1) {
+        unsigned char frame[17];
+        const char* payload = "hello";
+        frame[0] = 5; frame[1] = 0; frame[2] = 0; frame[3] = 0;
+        frame[4] = 0xEF; frame[5] = 0xBE; frame[6] = 0xAD; frame[7] = 0xDE;
+        memcpy(frame + 8, payload, 5);
+        unsigned crc = ipc_crc32((const unsigned char*)payload, 5);
+        frame[13] = (unsigned char)crc;
+        frame[14] = (unsigned char)(crc >> 8);
+        frame[15] = (unsigned char)(crc >> 16);
+        frame[16] = (unsigned char)(crc >> 24);
+        IpcIo io = tcp_io(conn);
+        io.write(io.ctx, frame, sizeof(frame)); /* 之后静默，不回 RESET_CONFIRM */
+    } else if (pa->mode == 2) {
+        VersionPeer* vp = (VersionPeer*)malloc(sizeof(VersionPeer));
+        vp->ms = ms_create(tcp_io(conn), 1, 0);
+        ms_on_message(vp->ms, version_on_msg, vp);
+        ms_on_error(vp->ms, silent_error, NULL);
+        ms_start(vp->ms);
+    }
+    Sleep(30000); /* 保持连接存活；进程结束前被终止 */
+    return NULL;
+}
+
+static TcpListener* start_peer(int mode) {
+    TcpListener* ln = tcp_listen("127.0.0.1", 0);
+    PeerArg* pa = (PeerArg*)malloc(sizeof(PeerArg));
+    pa->ln = ln; pa->mode = mode;
+    pthread_t t;
+    pthread_create(&t, NULL, peer_thread, pa);
+    pthread_detach(t);
+    return ln;
+}
+
+typedef struct {
+    volatile int count;
+    volatile int gotResyncTimeout;
+    volatile int gotHeartbeat;
+    char last[32];
+} ErrSink;
+
+static void capture_error(void* u, const char* msg, const char* code) {
+    (void)msg;
+    ErrSink* e = (ErrSink*)u;
+    e->count++;
+    if (code) {
+        snprintf(e->last, sizeof(e->last), "%s", code);
+        if (strcmp(code, "ERESYNC_TIMEOUT") == 0) e->gotResyncTimeout = 1;
+        if (strcmp(code, "EHEARTBEAT") == 0) e->gotHeartbeat = 1;
+    }
 }
 
 /* ---- 事件收集 ---- */
@@ -429,6 +550,134 @@ int main(void) {
         rpc_destroy(rpc);
         tcp_conn_free(conn);
         stop_server(s);
+    }
+
+    /* 10. HELLO 握手成功：token 匹配 -> ok:true，之后 RPC 正常 */
+    {
+        OptsServer* s = start_opts(0, 0, "secret");
+        TcpConn* conn;
+        RpcProtocol* rpc = dial_opts(s, &conn, 0, 0, "secret");
+        RpcResult h = rpc_hello(rpc, 1000);
+        JsonValue* ok = h.value ? json_get(h.value, "ok") : NULL;
+        JsonValue* ver = h.value ? json_get(h.value, "version") : NULL;
+        check("hello ok", ok && ok->type == JSON_BOOL && ok->u.boolean &&
+                          ver && ver->u.number == 1);
+        rpc_result_free(&h);
+        JsonValue* p = json_arr();
+        json_arr_push(p, json_num(1));
+        json_arr_push(p, json_num(2));
+        RpcResult r = rpc_send_request(rpc, "add", p, NULL);
+        check("rpc after hello", r.value && r.value->u.number == 3);
+        rpc_result_free(&r);
+        json_free(p);
+        rpc_destroy(rpc);
+        tcp_conn_free(conn);
+        stop_opts(s);
+    }
+    /* 11. HELLO 错误 token -> EAUTH，服务端断链 */
+    {
+        OptsServer* s = start_opts(0, 0, "secret");
+        TcpConn* conn;
+        RpcProtocol* rpc = dial_opts(s, &conn, 0, 0, "wrong");
+        RpcResult h = rpc_hello(rpc, 1000);
+        check("hello wrong token EAUTH", !h.value && h.code && strcmp(h.code, "EAUTH") == 0 &&
+                                         h.error && strcmp(h.error->u.str, "Unauthorized") == 0);
+        rpc_result_free(&h);
+        rpc_destroy(rpc);
+        tcp_conn_free(conn);
+        stop_opts(s);
+    }
+    /* 12. 未握手直接请求 -> Unauthorized 错误响应 + 断链 */
+    {
+        OptsServer* s = start_opts(0, 0, "secret");
+        TcpConn* conn;
+        RpcProtocol* rpc = dial_opts(s, &conn, 0, 0, NULL);
+        JsonValue* p = json_arr();
+        json_arr_push(p, json_num(1));
+        json_arr_push(p, json_num(2));
+        RpcResult r = rpc_send_request_timeout(rpc, "add", p, NULL, 1000);
+        check("unauthorized", r.remote && r.error && r.error->type == JSON_STR &&
+                              strcmp(r.error->u.str, "Unauthorized") == 0);
+        rpc_result_free(&r);
+        json_free(p);
+        rpc_destroy(rpc);
+        tcp_conn_free(conn);
+        stop_opts(s);
+    }
+    /* 13. 版本不匹配：裸对端回 HELLO_ACK version=99 -> EVERSION */
+    {
+        TcpListener* ln = start_peer(2);
+        TcpConn* conn = tcp_connect("127.0.0.1", tcp_listener_port(ln));
+        RpcProtocol* rpc = rpc_create_options(ms_create(tcp_io(conn), 1, 0), 0, 0, NULL, NULL);
+        rpc_on_error(rpc, silent_error, NULL);
+        RpcResult h = rpc_hello(rpc, 1000);
+        check("version mismatch EVERSION", !h.value && h.code && strcmp(h.code, "EVERSION") == 0);
+        rpc_result_free(&h);
+        rpc_destroy(rpc);
+        tcp_conn_free(conn);
+        tcp_listener_free(ln);
+    }
+    /* 14. 心跳保活：短间隔 PING/PONG 交换后连接仍可用 */
+    {
+        OptsServer* s = start_opts(100, 5000, NULL);
+        TcpConn* conn;
+        RpcProtocol* rpc = dial_opts(s, &conn, 100, 5000, NULL);
+        Sleep(500);
+        JsonValue* p = json_arr();
+        json_arr_push(p, json_num(3));
+        json_arr_push(p, json_num(4));
+        RpcResult r = rpc_send_request(rpc, "add", p, NULL);
+        check("heartbeat keepalive", r.value && r.value->u.number == 7);
+        rpc_result_free(&r);
+        json_free(p);
+        rpc_destroy(rpc);
+        tcp_conn_free(conn);
+        stop_opts(s);
+    }
+    /* 15. 心跳超时：静默对端 -> EHEARTBEAT 结算 pending + 断链 */
+    {
+        TcpListener* ln = start_peer(0);
+        TcpConn* conn = tcp_connect("127.0.0.1", tcp_listener_port(ln));
+        MessageStream* ms = ms_create(tcp_io(conn), 1, 0);
+        RpcProtocol* rpc = rpc_create_options(ms, 100, 300, NULL, NULL);
+        ErrSink sink = {0};
+        rpc_on_error(rpc, capture_error, &sink);
+        JsonValue* p = json_arr();
+        json_arr_push(p, json_num(1));
+        json_arr_push(p, json_num(2));
+        RpcResult r = rpc_send_request(rpc, "add", p, NULL);
+        check("heartbeat timeout EHEARTBEAT", !r.value && r.code && strcmp(r.code, "EHEARTBEAT") == 0);
+        rpc_result_free(&r);
+        json_free(p);
+        check("heartbeat closes stream", ms_is_closed(ms));
+        rpc_destroy(rpc);
+        tcp_conn_free(conn);
+        tcp_listener_free(ln);
+    }
+    /* 16. 重同步超时：坏帧对端发错误包后静默，不回 RESET_CONFIRM -> ERESYNC_TIMEOUT 断链 */
+    {
+        TcpListener* ln = start_peer(1);
+        TcpConn* conn = tcp_connect("127.0.0.1", tcp_listener_port(ln));
+        MessageStream* ms = ms_create(tcp_io(conn), 1, 0);
+        ms_set_sync_timeout(ms, 300);
+        RpcProtocol* rpc = rpc_create_options(ms, 0, 0, NULL, NULL);
+        ErrSink sink = {0};
+        rpc_on_error(rpc, capture_error, &sink);
+        JsonValue* p = json_arr();
+        json_arr_push(p, json_num(1));
+        json_arr_push(p, json_num(2));
+        RpcResult r = rpc_send_request(rpc, "add", p, NULL);
+        check("resync pending rejected", !r.value && r.code &&
+                                         (strcmp(r.code, "LENGTH_CRC_FAILED") == 0 ||
+                                          strcmp(r.code, "ERESYNC_TIMEOUT") == 0));
+        rpc_result_free(&r);
+        json_free(p);
+        Sleep(500); /* 等满 300ms 重同步计时 */
+        check("resync timeout ERESYNC_TIMEOUT", sink.gotResyncTimeout);
+        check("resync timeout closes stream", ms_is_closed(ms));
+        rpc_destroy(rpc);
+        tcp_conn_free(conn);
+        tcp_listener_free(ln);
     }
 
     printf("\n%d passed, %d failed\n", passed, failed);

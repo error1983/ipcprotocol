@@ -55,7 +55,7 @@ static void runServer(uint16_t port) {
         auto conn = ln.accept();
         std::thread([conn] {
             auto rpc = std::make_shared<RpcProtocol>(std::make_shared<MessageStream>(conn));
-            rpc->onError([](const std::string&) {});
+            rpc->onError([](const StreamError&) {});
             registerMethods(rpc);
             // 保持连接存活
             std::this_thread::sleep_for(std::chrono::hours(24));
@@ -78,7 +78,7 @@ static void check(const char* name, bool ok) {
 static void runClient(uint16_t port) {
     auto conn = tcpConnect("127.0.0.1", port);
     auto rpc = std::make_shared<RpcProtocol>(std::make_shared<MessageStream>(conn));
-    rpc->onError([](const std::string&) {});
+    rpc->onError([](const StreamError&) {});
 
     check("add", rpc->sendRequest("add", Json::ofArr({Json::ofNum(3), Json::ofNum(4)})).asNum() == 7);
 

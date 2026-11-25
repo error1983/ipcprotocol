@@ -3,6 +3,7 @@ package ipc
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"hash/crc32"
 	"net"
@@ -302,5 +303,228 @@ func TestRPCTimeout(t *testing.T) {
 	time.Sleep(600 * time.Millisecond)
 	if v, err := rpc.SendRequest("add", []any{5, 6}); err != nil || v.(float64) != 11 {
 		t.Fatalf("late response: %v %v", v, err)
+	}
+}
+
+// ---- v1.1 用例（PROTOCOL.md §4.5/§8.1/§8.2） ----
+
+var keepAliveMu sync.Mutex
+var keepAliveConns []net.Conn // 防止静默对端连接被提前关闭
+
+func keepConn(c net.Conn) {
+	keepAliveMu.Lock()
+	keepAliveConns = append(keepAliveConns, c)
+	keepAliveMu.Unlock()
+}
+
+type rpcPair struct {
+	ln     net.Listener
+	server *RpcProtocol
+	cli    *RpcProtocol
+}
+
+func newPair(t *testing.T, hbInterval, hbTimeout time.Duration, authToken, requiredToken string) *rpcPair {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := &rpcPair{ln: ln}
+	ready := make(chan struct{})
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		keepConn(conn)
+		ms := NewMessageStream(conn, conn)
+		p.server = NewRpcProtocolOptions(ms, hbInterval, hbTimeout, "", requiredToken)
+		p.server.OnError = func(err error) {}
+		p.server.RegisterMethod("add", func(a []any) (any, error) {
+			return a[0].(float64) + a[1].(float64), nil
+		})
+		close(ready)
+	}()
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.cli = NewRpcProtocolOptions(NewMessageStream(conn, conn), hbInterval, hbTimeout, authToken, "")
+	p.cli.OnError = func(err error) {}
+	<-ready
+	return p
+}
+
+func (p *rpcPair) close() {
+	p.cli.Close()
+	p.server.Close()
+	_ = p.ln.Close()
+}
+
+func TestHelloOK(t *testing.T) {
+	p := newPair(t, 0, 0, "secret", "secret")
+	defer p.close()
+	v, err := p.cli.Hello()
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := v.(map[string]any)
+	if m["ok"] != true || m["version"].(float64) != 1 {
+		t.Fatalf("hello ack = %v", m)
+	}
+	if v, err := p.cli.SendRequest("add", []any{1, 2}); err != nil || v.(float64) != 3 {
+		t.Fatalf("rpc after hello: %v %v", v, err)
+	}
+}
+
+func TestHelloWrongToken(t *testing.T) {
+	p := newPair(t, 0, 0, "wrong", "secret")
+	defer p.close()
+	_, err := p.cli.Hello()
+	re, ok := err.(*RpcError)
+	if !ok || re.Code != "EAUTH" || re.Value != "Unauthorized" {
+		t.Fatalf("hello err = %v", err)
+	}
+}
+
+func TestUnauthorizedRequest(t *testing.T) {
+	p := newPair(t, 0, 0, "", "secret")
+	defer p.close()
+	_, err := p.cli.SendRequest("add", []any{1, 2})
+	re, ok := err.(*RpcError)
+	if !ok || re.Value != "Unauthorized" {
+		t.Fatalf("unauthorized err = %v", err)
+	}
+}
+
+func TestHelloVersionMismatch(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		keepConn(conn)
+		ms := NewMessageStream(conn, conn)
+		ms.OnMessage = func(data []byte) {
+			id := bytesToUUID(data[2:18])
+			body, _ := json.Marshal(map[string]any{"version": 99, "ok": true})
+			_ = ms.Send(buildMessage(TypeHelloAck, ContentJSON, id, body))
+		}
+		ms.Start()
+	}()
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cli := NewRpcProtocolOptions(NewMessageStream(conn, conn), 0, 0, "", "")
+	cli.OnError = func(err error) {}
+	defer cli.Close()
+	_, err = cli.Hello()
+	re, ok := err.(*RpcError)
+	if !ok || re.Code != "EVERSION" {
+		t.Fatalf("version mismatch err = %v", err)
+	}
+}
+
+func TestHeartbeatKeepalive(t *testing.T) {
+	p := newPair(t, 100*time.Millisecond, 5*time.Second, "", "")
+	defer p.close()
+	time.Sleep(500 * time.Millisecond) // 期间应有多轮 PING/PONG 交换
+	if v, err := p.cli.SendRequest("add", []any{3, 4}); err != nil || v.(float64) != 7 {
+		t.Fatalf("heartbeat keepalive: %v %v", v, err)
+	}
+}
+
+func TestHeartbeatTimeout(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		keepConn(conn) // 保持连接但不回任何数据
+	}()
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ms := NewMessageStream(conn, conn)
+	cli := NewRpcProtocolOptions(ms, 100*time.Millisecond, 300*time.Millisecond, "", "")
+	cli.OnError = func(err error) {}
+	defer cli.Close()
+	_, err = cli.SendRequest("add", []any{1, 2})
+	re, ok := err.(*RpcError)
+	if !ok || re.Code != "EHEARTBEAT" {
+		t.Fatalf("heartbeat timeout err = %v", err)
+	}
+	if !ms.isClosed() {
+		t.Fatal("heartbeat timeout should close stream")
+	}
+}
+
+func TestResyncTimeout(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		keepConn(conn)
+		payload := []byte("hello")
+		frame := make([]byte, 8+len(payload)+4)
+		binary.LittleEndian.PutUint32(frame[0:4], uint32(len(payload)))
+		binary.LittleEndian.PutUint32(frame[4:8], 0xDEADBEEF)
+		copy(frame[8:], payload)
+		binary.LittleEndian.PutUint32(frame[8+len(payload):], crc32.ChecksumIEEE(payload))
+		_, _ = conn.Write(frame) // 之后保持静默，不回 RESET_CONFIRM
+	}()
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ms := NewMessageStream(conn, conn)
+	ms.SyncTimeout = 300 * time.Millisecond
+	cli := NewRpcProtocolOptions(ms, 0, 0, "", "")
+	codes := make(chan string, 16)
+	cli.OnError = func(err error) {
+		if se, ok := err.(*StreamError); ok {
+			select {
+			case codes <- se.Code:
+			default:
+			}
+		}
+	}
+	defer cli.Close()
+	_, err = cli.SendRequest("add", []any{1, 2})
+	re, ok := err.(*RpcError)
+	if !ok || (re.Code != "LENGTH_CRC_FAILED" && re.Code != "ERESYNC_TIMEOUT") {
+		t.Fatalf("resync pending err = %v", err)
+	}
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case code := <-codes:
+			if code == "ERESYNC_TIMEOUT" {
+				if !ms.isClosed() {
+					t.Fatal("resync timeout should close stream")
+				}
+				return
+			}
+		case <-deadline:
+			t.Fatal("ERESYNC_TIMEOUT not emitted")
+		}
 	}
 }

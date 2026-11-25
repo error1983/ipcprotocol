@@ -2,41 +2,50 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Mutex, Once};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Mutex, Once, Weak};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::json::{self, Json};
-use crate::message_stream::MessageStream;
+use crate::message_stream::{MessageStream, StreamError};
 
 pub const TYPE_REQUEST: u8 = 0;
 pub const TYPE_RESPONSE: u8 = 1;
 pub const TYPE_EVENT: u8 = 2;
+pub const TYPE_PING: u8 = 3;
+pub const TYPE_PONG: u8 = 4;
+pub const TYPE_HELLO: u8 = 5;
+pub const TYPE_HELLO_ACK: u8 = 6;
 
 pub const CONTENT_TEXT: u8 = 0;
 pub const CONTENT_JSON: u8 = 1;
 pub const CONTENT_BINARY: u8 = 2;
 
+/// 线协议版本（HELLO 协商用）。
+pub const PROTOCOL_VERSION: f64 = 1.0;
+
 /// 服务端方法处理器：args 为展开后的参数；Err(String) 转为 {"error": ...} 响应。
 pub type Handler = Box<dyn Fn(Vec<Json>) -> Result<Json, String> + Send + Sync>;
 
 /// RPC 错误：Remote 携带对端原始 error 值（对齐 JS reject(response.error)）；
-/// Timeout 为本地超时（code=ETIMEDOUT）。
+/// Timeout 为本地超时（code=ETIMEDOUT）；Coded 携带显式错误码（EAUTH/EVERSION/EHEARTBEAT/流错误码）。
 #[derive(Debug, Clone)]
 pub enum RpcError {
     Remote(Json),
     Message(String),
     Timeout(String),
+    Coded { message: String, code: String },
 }
 
 impl RpcError {
     /// 错误码，对齐 JS 修复版 RpcError.code。
-    pub fn code(&self) -> &'static str {
+    pub fn code(&self) -> String {
         match self {
-            RpcError::Remote(_) => "EREMOTE",
-            RpcError::Timeout(_) => "ETIMEDOUT",
-            RpcError::Message(_) => "",
+            RpcError::Remote(_) => "EREMOTE".to_string(),
+            RpcError::Timeout(_) => "ETIMEDOUT".to_string(),
+            RpcError::Message(_) => String::new(),
+            RpcError::Coded { code, .. } => code.clone(),
         }
     }
 }
@@ -46,6 +55,7 @@ impl fmt::Display for RpcError {
         match self {
             RpcError::Remote(v) => write!(f, "rpc error: {}", json::stringify(v)),
             RpcError::Message(m) | RpcError::Timeout(m) => write!(f, "{}", m),
+            RpcError::Coded { message, .. } => write!(f, "{}", message),
         }
     }
 }
@@ -60,15 +70,35 @@ pub struct RpcProtocol {
     handlers: Arc<Mutex<HashMap<String, Arc<Handler>>>>,
     pending: Arc<Mutex<PendingMap>>,
     on_event: Arc<Mutex<Option<EventCb>>>,
-    on_error: Arc<Mutex<Option<Box<dyn Fn(String) + Send>>>>,
+    on_error: Arc<Mutex<Option<Box<dyn Fn(StreamError) + Send>>>>,
     /// 默认 RPC 超时（毫秒），对齐 JS 修复版 15s；0 表示关闭。
     default_timeout_ms: AtomicU64,
+    // ---- v1.1: 心跳与 HELLO 握手（PROTOCOL.md §8.1/§8.2） ----
+    last_received: Arc<AtomicU64>,
+    authenticated: Arc<AtomicBool>,
+    auth_token: Option<String>,
     close_once: Once,
 }
 
+fn now_ms() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+
 impl RpcProtocol {
-    /// 包装消息流：先注册回调再启动读循环，避免早到消息丢失。
+    /// 包装消息流（默认心跳 5s/15s，不鉴权）：先注册回调再启动读循环，避免早到消息丢失。
     pub fn new(ms: MessageStream) -> Arc<Self> {
+        Self::new_with_options(ms, Duration::from_secs(5), Duration::from_secs(15), None, None)
+    }
+
+    /// 带心跳与鉴权配置的构造。
+    /// heartbeat_interval 为零关闭心跳；required_token 非 None 时未通过 HELLO 鉴权的请求被拒绝。
+    pub fn new_with_options(
+        ms: MessageStream,
+        heartbeat_interval: Duration,
+        heartbeat_timeout: Duration,
+        auth_token: Option<String>,
+        required_token: Option<String>,
+    ) -> Arc<Self> {
         let rpc = Arc::new(RpcProtocol {
             ms: ms.clone(),
             handlers: Arc::new(Mutex::new(HashMap::new())),
@@ -76,6 +106,9 @@ impl RpcProtocol {
             on_event: Arc::new(Mutex::new(None)),
             on_error: Arc::new(Mutex::new(None)),
             default_timeout_ms: AtomicU64::new(15000),
+            last_received: Arc::new(AtomicU64::new(now_ms())),
+            authenticated: Arc::new(AtomicBool::new(required_token.is_none())),
+            auth_token,
             close_once: Once::new(),
         });
 
@@ -83,23 +116,61 @@ impl RpcProtocol {
             let handlers = rpc.handlers.clone();
             let pending = rpc.pending.clone();
             let on_event = rpc.on_event.clone();
+            let authenticated = rpc.authenticated.clone();
+            let last_received = rpc.last_received.clone();
+            let required = required_token.clone();
+            let weak = Arc::downgrade(&rpc);
             let ms2 = ms.clone();
             ms.on_message(Box::new(move |data| {
-                handle_message(&data, &handlers, &pending, &on_event, &ms2);
+                handle_message(&data, &handlers, &pending, &on_event, &ms2, &authenticated, &required, &last_received, &weak);
             }));
         }
         {
             let pending = rpc.pending.clone();
             let on_error = rpc.on_error.clone();
-            ms.on_error(Box::new(move |msg| {
-                reject_all(&pending, RpcError::Message(format!("Request failed: {}", msg)));
+            ms.on_error(Box::new(move |e: StreamError| {
+                reject_all(&pending, RpcError::Coded {
+                    message: format!("Request failed: {}", e.message),
+                    code: e.code.clone(),
+                });
                 let cb = on_error.lock().unwrap();
                 if let Some(f) = &*cb {
-                    f(msg);
+                    f(e);
                 }
             }));
         }
         ms.start();
+
+        let interval_ms = heartbeat_interval.as_millis() as u64;
+        let timeout_ms = heartbeat_timeout.as_millis() as u64;
+        if interval_ms > 0 {
+            let weak = Arc::downgrade(&rpc);
+            thread::spawn(move || loop {
+                thread::sleep(Duration::from_millis(interval_ms));
+                let rpc = match weak.upgrade() {
+                    Some(r) => r,
+                    None => return,
+                };
+                if rpc.ms.is_closed() {
+                    return;
+                }
+                let silent = now_ms().saturating_sub(rpc.last_received.load(Ordering::SeqCst));
+                if timeout_ms > 0 && silent >= timeout_ms {
+                    let msg = format!("heartbeat timeout: no data for {}ms", silent);
+                    reject_all(&rpc.pending, RpcError::Coded { message: msg.clone(), code: "EHEARTBEAT".into() });
+                    let cb = rpc.on_error.lock().unwrap();
+                    if let Some(f) = &*cb {
+                        f(StreamError { message: msg, code: "EHEARTBEAT".into() });
+                    }
+                    drop(cb);
+                    rpc.close();
+                    return;
+                }
+                if silent >= interval_ms {
+                    let _ = rpc.ms.send(&build_message(TYPE_PING, CONTENT_TEXT, &new_uuid(), b""));
+                }
+            });
+        }
         rpc
     }
 
@@ -111,7 +182,7 @@ impl RpcProtocol {
         *self.on_event.lock().unwrap() = Some(f);
     }
 
-    pub fn on_error(&self, f: Box<dyn Fn(String) + Send>) {
+    pub fn on_error(&self, f: Box<dyn Fn(StreamError) + Send>) {
         *self.on_error.lock().unwrap() = Some(f);
     }
 
@@ -220,6 +291,32 @@ impl RpcProtocol {
             self.ms.close();
         });
     }
+
+    // ---- v1.1: HELLO 握手 ----
+
+    /// 发起 HELLO 握手（默认超时）；ACK error → EAUTH，版本不符 → EVERSION。
+    pub fn hello(&self) -> Result<Json, RpcError> {
+        self.hello_timeout(self.default_timeout())
+    }
+
+    /// 带显式超时的 HELLO 握手；Duration::ZERO 关闭超时。
+    pub fn hello_timeout(&self, timeout: Duration) -> Result<Json, RpcError> {
+        let id = new_uuid();
+        let (tx, rx) = mpsc::channel();
+        self.pending.lock().unwrap().insert(id.clone(), tx);
+
+        let mut payload = Json::obj();
+        payload.insert("version", Json::Num(PROTOCOL_VERSION));
+        if let Some(token) = &self.auth_token {
+            payload.insert("token", Json::Str(token.clone()));
+        }
+        let body = json::stringify(&payload);
+        if let Err(e) = self.ms.send(&build_message(TYPE_HELLO, CONTENT_JSON, &id, body.as_bytes())) {
+            self.pending.lock().unwrap().remove(&id);
+            return Err(RpcError::Message(e.to_string()));
+        }
+        self.wait_result(&id, rx, "hello", timeout)
+    }
 }
 
 fn reject_all(pending: &Arc<Mutex<PendingMap>>, err: RpcError) {
@@ -235,6 +332,10 @@ fn handle_message(
     pending: &Arc<Mutex<PendingMap>>,
     on_event: &Arc<Mutex<Option<EventCb>>>,
     ms: &MessageStream,
+    authenticated: &AtomicBool,
+    required_token: &Option<String>,
+    last_received: &AtomicU64,
+    rpc_weak: &Weak<RpcProtocol>,
 ) {
     if data.len() < 18 {
         eprintln!("[ipc] message too short: {}", data.len());
@@ -242,8 +343,13 @@ fn handle_message(
     }
     let msg_type = data[0];
     let content_type = data[1];
+    if msg_type > 6 {
+        eprintln!("[ipc] unknown message type: {}", msg_type);
+        return;
+    }
     let id = bytes_to_uuid(&data[2..18]);
     let payload = &data[18..];
+    last_received.store(now_ms(), Ordering::SeqCst); // 任何入站消息都刷新心跳基准
 
     let content = match deserialize(content_type, payload) {
         Ok(c) => c,
@@ -259,6 +365,13 @@ fn handle_message(
 
     match msg_type {
         TYPE_REQUEST => {
+            if !authenticated.load(Ordering::SeqCst) {
+                send_error_response(ms, &id, "Unauthorized");
+                if let Some(rpc) = rpc_weak.upgrade() {
+                    rpc.close();
+                }
+                return;
+            }
             let handlers = handlers.clone();
             let ms = ms.clone();
             let raw = payload.to_vec();
@@ -279,13 +392,91 @@ fn handle_message(
             }
         }
         TYPE_EVENT => {
+            if !authenticated.load(Ordering::SeqCst) {
+                return; // 未鉴权事件直接丢弃
+            }
             let cb = on_event.lock().unwrap();
             if let Some(f) = &*cb {
                 f(content_type, content);
             }
         }
+        TYPE_PING => {
+            let _ = ms.send(&build_message(TYPE_PONG, CONTENT_TEXT, &id, b""));
+        }
+        TYPE_PONG => {
+            // 仅刷新 last_received（上面已做）
+        }
+        TYPE_HELLO => handle_hello(ms, &id, &content, authenticated, required_token, rpc_weak),
+        TYPE_HELLO_ACK => {
+            let tx = pending.lock().unwrap().remove(&id);
+            if let Some(tx) = tx {
+                let _ = tx.send(parse_hello_ack(&content));
+            }
+        }
         _ => eprintln!("[ipc] unknown message type: {}", msg_type),
     }
+}
+
+/// 服务端 HELLO 处理：版本/token 校验，失败回 error ACK 后断链。
+fn handle_hello(
+    ms: &MessageStream,
+    id: &str,
+    content: &Json,
+    authenticated: &AtomicBool,
+    required_token: &Option<String>,
+    rpc_weak: &Weak<RpcProtocol>,
+) {
+    let mut ack = Json::obj();
+    ack.insert("version", Json::Num(PROTOCOL_VERSION));
+    let mut ok = false;
+    if matches!(content, Json::Obj(_)) {
+        let version = content.get("version").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        if version != PROTOCOL_VERSION {
+            ack.insert("error", Json::Str("Unsupported protocol version".into()));
+        } else if let Some(required) = required_token {
+            let token = content.get("token").and_then(|t| t.as_str()).unwrap_or("");
+            if token != required {
+                ack.insert("error", Json::Str("Unauthorized".into()));
+            } else {
+                authenticated.store(true, Ordering::SeqCst);
+                ack.insert("ok", Json::Bool(true));
+                ok = true;
+            }
+        } else {
+            authenticated.store(true, Ordering::SeqCst);
+            ack.insert("ok", Json::Bool(true));
+            ok = true;
+        }
+    } else {
+        ack.insert("error", Json::Str("Invalid hello payload".into()));
+    }
+    let body = json::stringify(&ack).into_bytes();
+    if let Err(e) = ms.send(&build_message(TYPE_HELLO_ACK, CONTENT_JSON, id, &body)) {
+        eprintln!("[ipc] send hello ack failed: {}", e);
+    }
+    if !ok {
+        if let Some(rpc) = rpc_weak.upgrade() {
+            rpc.close(); // 握手失败后服务端断链
+        }
+    }
+}
+
+/// 客户端 HELLO_ACK 解析：error → EAUTH，版本不符 → EVERSION。
+fn parse_hello_ack(content: &Json) -> Result<Json, RpcError> {
+    if !matches!(content, Json::Obj(_)) {
+        return Err(RpcError::Coded { message: "Invalid hello ack payload".into(), code: "EAUTH".into() });
+    }
+    if let Some(ev) = content.get("error") {
+        if ev.is_truthy() {
+            let msg = ev.as_str().map(|s| s.to_string()).unwrap_or_else(|| json::stringify(ev));
+            return Err(RpcError::Coded { message: msg, code: "EAUTH".into() });
+        }
+    }
+    let version = content.get("version").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    if version != PROTOCOL_VERSION {
+        return Err(RpcError::Coded { message: "Unsupported protocol version".into(), code: "EVERSION".into() });
+    }
+    Ok(content.clone())
 }
 
 fn send_error_response(ms: &MessageStream, id: &str, msg: &str) {

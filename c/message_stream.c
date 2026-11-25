@@ -1,9 +1,11 @@
 #include "message_stream.h"
 
+#include <errno.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 typedef struct { unsigned char* data; size_t head, len, cap; } Buf;
 
@@ -67,21 +69,32 @@ struct MessageStream {
 
     void (*on_message)(void*, const unsigned char*, size_t);
     void* on_message_user;
-    void (*on_error)(void*, const char*);
+    void (*on_error)(void*, const char*, const char*);
     void* on_error_user;
     void (*on_sync)(void*);
     void* on_sync_user;
 
     pthread_mutex_t send_mu;
     int started;
-    int closed;
     pthread_t thread;
 
-    /* 以下仅读线程访问 */
-    Buf buf;
+    /* 跨线程状态：门控/关闭/重同步计时 */
+    pthread_mutex_t state_mu;
+    pthread_cond_t sync_cv;     /* 门控唤醒 + 计时提前唤醒 */
+    pthread_cond_t watchers_cv; /* 计时线程归零通知 */
+    int closed;
+    int io_closed;
     int protocolMode;
+    int sync_timeout_ms;
+    unsigned long long sync_generation;
+    int sync_watchers;
+
+    /* 以下缓冲状态仅读线程访问 */
+    Buf buf;
     long expectedLen;
 };
+
+typedef struct { MessageStream* ms; unsigned long long gen; int timeout; } SyncWatchArg;
 
 MessageStream* ms_create(IpcIo io, int enableCRC, size_t maxBufferSize) {
     MessageStream* ms = (MessageStream*)calloc(1, sizeof(MessageStream));
@@ -89,7 +102,11 @@ MessageStream* ms_create(IpcIo io, int enableCRC, size_t maxBufferSize) {
     ms->enableCRC = enableCRC;
     ms->maxBufferSize = maxBufferSize ? maxBufferSize : 256 * 1024 * 1024;
     ms->expectedLen = -1;
+    ms->sync_timeout_ms = 3000;
     pthread_mutex_init(&ms->send_mu, NULL);
+    pthread_mutex_init(&ms->state_mu, NULL);
+    pthread_cond_init(&ms->sync_cv, NULL);
+    pthread_cond_init(&ms->watchers_cv, NULL);
     return ms;
 }
 
@@ -98,7 +115,7 @@ void ms_on_message(MessageStream* ms, void (*cb)(void*, const unsigned char*, si
     ms->on_message_user = user;
 }
 
-void ms_on_error(MessageStream* ms, void (*cb)(void*, const char*), void* user) {
+void ms_on_error(MessageStream* ms, void (*cb)(void*, const char*, const char*), void* user) {
     ms->on_error = cb;
     ms->on_error_user = user;
 }
@@ -108,19 +125,77 @@ void ms_on_sync_complete(MessageStream* ms, void (*cb)(void*), void* user) {
     ms->on_sync_user = user;
 }
 
-static void emit_error(MessageStream* ms, const char* msg) {
-    if (ms->on_error) ms->on_error(ms->on_error_user, msg);
+static void emit_error(MessageStream* ms, const char* msg, const char* code) {
+    if (ms->on_error) ms->on_error(ms->on_error_user, msg, code);
+}
+
+/* 退出协议模式：作废旧计时并唤醒门控中的发送方 */
+static void exit_protocol_mode(MessageStream* ms) {
+    pthread_mutex_lock(&ms->state_mu);
+    ms->protocolMode = 0;
+    ms->sync_generation++;
+    pthread_cond_broadcast(&ms->sync_cv);
+    pthread_mutex_unlock(&ms->state_mu);
+}
+
+/* 重同步计时：超时仍未收到 RESET_CONFIRM 则以 ERESYNC_TIMEOUT 断链。
+ * 用 cond_timedwait 以便 close/退出协议模式时提前唤醒，避免 destroy 阻塞满超时。 */
+static void* sync_watch(void* arg) {
+    SyncWatchArg* a = (SyncWatchArg*)arg;
+    MessageStream* ms = a->ms;
+    pthread_mutex_lock(&ms->state_mu);
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += a->timeout / 1000;
+    ts.tv_nsec += (long)(a->timeout % 1000) * 1000000L;
+    if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+    while (ms->protocolMode && !ms->closed && ms->sync_generation == a->gen) {
+        if (pthread_cond_timedwait(&ms->sync_cv, &ms->state_mu, &ts) == ETIMEDOUT) break;
+    }
+    int fire = ms->protocolMode && !ms->closed && ms->sync_generation == a->gen;
+    if (fire) {
+        ms->closed = 1;
+        ms->io_closed = 1;
+        pthread_cond_broadcast(&ms->sync_cv);
+    }
+    ms->sync_watchers--;
+    if (ms->sync_watchers == 0) pthread_cond_broadcast(&ms->watchers_cv);
+    pthread_mutex_unlock(&ms->state_mu);
+    if (fire) {
+        emit_error(ms, "resync handshake timeout", "ERESYNC_TIMEOUT");
+        if (ms->io.close) ms->io.close(ms->io.ctx);
+    }
+    free(a);
+    return NULL;
 }
 
 static void ms_reset(MessageStream* ms) {
-    ms->protocolMode = 1;
     buf_clear(&ms->buf);
     ms->expectedLen = -1;
+    pthread_mutex_lock(&ms->state_mu);
+    ms->protocolMode = 1;
+    unsigned long long gen = ++ms->sync_generation;
+    int timeout = ms->sync_timeout_ms;
+    if (timeout > 0) ms->sync_watchers++;
+    pthread_mutex_unlock(&ms->state_mu);
+    if (timeout > 0) {
+        SyncWatchArg* a = (SyncWatchArg*)malloc(sizeof(SyncWatchArg));
+        a->ms = ms; a->gen = gen; a->timeout = timeout;
+        pthread_t t;
+        if (pthread_create(&t, NULL, sync_watch, a) != 0) {
+            pthread_mutex_lock(&ms->state_mu);
+            ms->sync_watchers--;
+            if (ms->sync_watchers == 0) pthread_cond_broadcast(&ms->watchers_cv);
+            pthread_mutex_unlock(&ms->state_mu);
+            free(a);
+        } else {
+            pthread_detach(t);
+        }
+    }
 }
 
-int ms_send(MessageStream* ms, const unsigned char* data, size_t len) {
-    if (ms->closed) return 0;
-    if (len > ms->maxBufferSize) return 0;
+/* 底层帧发送（旁路门控）：错误包/协议消息与已放行后的业务帧共用 */
+static int send_frame(MessageStream* ms, const unsigned char* data, size_t len) {
     size_t headerSize = ms->enableCRC ? 8 : 4;
     size_t total = headerSize + len + (ms->enableCRC ? 4 : 0);
     unsigned char* frame = (unsigned char*)malloc(total);
@@ -135,9 +210,19 @@ int ms_send(MessageStream* ms, const unsigned char* data, size_t len) {
     return ok;
 }
 
+int ms_send(MessageStream* ms, const unsigned char* data, size_t len) {
+    if (len > ms->maxBufferSize) return 0;
+    pthread_mutex_lock(&ms->state_mu);
+    while (ms->protocolMode && !ms->closed) pthread_cond_wait(&ms->sync_cv, &ms->state_mu);
+    int closed = ms->closed;
+    pthread_mutex_unlock(&ms->state_mu);
+    if (closed) return 0;
+    return send_frame(ms, data, len);
+}
+
 int ms_send_error(MessageStream* ms, unsigned char code) {
     unsigned char pkt[5] = {0xEE, 0xEE, 0xEE, 0xEE, code};
-    return ms_send(ms, pkt, 5);
+    return send_frame(ms, pkt, 5);
 }
 
 int ms_send_protocol(MessageStream* ms, const char* data, size_t len) {
@@ -156,7 +241,7 @@ int ms_send_protocol(MessageStream* ms, const char* data, size_t len) {
 static void process_buffer(MessageStream* ms) {
     for (;;) {
         if (ms->buf.len > ms->maxBufferSize) {
-            emit_error(ms, "buffer overflow");
+            emit_error(ms, "buffer overflow", "BUFFER_OVERFLOW");
             ms_send_error(ms, IPC_ERR_BUFFER_OVERFLOW);
             ms_reset(ms);
             return;
@@ -188,8 +273,8 @@ static void process_buffer(MessageStream* ms) {
                 while (n > 0 && (t[n - 1] == ' ' || t[n - 1] == '\t' || t[n - 1] == '\n' || t[n - 1] == '\r')) n--;
                 t[n] = '\0';
                 if (strcmp(t, "RESET_CONFIRM") == 0) {
-                    ms->protocolMode = 0;
                     buf_clear(&ms->buf);
+                    exit_protocol_mode(ms);
                     if (ms->on_sync) ms->on_sync(ms->on_sync_user);
                 }
                 continue;
@@ -208,7 +293,7 @@ static void process_buffer(MessageStream* ms) {
                 unsigned expected = read_le32(ms->buf.data + ms->buf.head + 4);
                 if (ipc_crc32(ms->buf.data + ms->buf.head, 4) != expected) {
                     ms_send_error(ms, IPC_ERR_LENGTH_CRC_FAILED);
-                    emit_error(ms, "length header CRC check failed");
+                    emit_error(ms, "length header CRC check failed", "LENGTH_CRC_FAILED");
                     ms_reset(ms);
                     return;
                 }
@@ -220,7 +305,7 @@ static void process_buffer(MessageStream* ms) {
                 ms_send_error(ms, code);
                 char msg[64];
                 snprintf(msg, sizeof(msg), "invalid frame length %u", length);
-                emit_error(ms, msg);
+                emit_error(ms, msg, "BAD_LENGTH");
                 ms_reset(ms);
                 return;
             }
@@ -237,7 +322,7 @@ static void process_buffer(MessageStream* ms) {
             if (ipc_crc32(data, (size_t)ms->expectedLen) != expected) {
                 free(data);
                 ms_send_error(ms, IPC_ERR_MESSAGE_CRC_FAILED);
-                emit_error(ms, "message CRC check failed");
+                emit_error(ms, "message CRC check failed", "MESSAGE_CRC_FAILED");
                 ms_reset(ms);
                 return;
             }
@@ -248,9 +333,10 @@ static void process_buffer(MessageStream* ms) {
         /* 错误包可能 reset 清空缓冲区，故先消费再分发 */
         if (dataLen == 5 && data[0] == 0xEE && data[1] == 0xEE && data[2] == 0xEE && data[3] == 0xEE) {
             free(data);
+            emit_error(ms, "peer reported error packet", "ERESYNC");
             ms_reset(ms);
             ms_send_protocol(ms, "RESET_CONFIRM", 13);
-            ms->protocolMode = 0;
+            exit_protocol_mode(ms);
         } else {
             if (ms->on_message) ms->on_message(ms->on_message_user, data, dataLen);
             free(data);
@@ -269,7 +355,10 @@ static void* read_loop(void* arg) {
             process_buffer(ms);
         }
         if (n <= 0) {
-            if (!ms->closed) emit_error(ms, n == 0 ? "stream ended" : "stream read error");
+            if (!ms->closed) {
+                if (n == 0) emit_error(ms, "stream ended", "ECLOSED");
+                else emit_error(ms, "stream read error", "ESOCKET");
+            }
             return NULL;
         }
     }
@@ -281,15 +370,38 @@ void ms_start(MessageStream* ms) {
     pthread_create(&ms->thread, NULL, read_loop, ms);
 }
 
+void ms_set_sync_timeout(MessageStream* ms, int timeoutMs) {
+    ms->sync_timeout_ms = timeoutMs;
+}
+
+int ms_is_closed(MessageStream* ms) {
+    pthread_mutex_lock(&ms->state_mu);
+    int c = ms->closed;
+    pthread_mutex_unlock(&ms->state_mu);
+    return c;
+}
+
 void ms_close(MessageStream* ms) {
+    pthread_mutex_lock(&ms->state_mu);
+    int do_close = !ms->io_closed;
+    ms->io_closed = 1;
     ms->closed = 1;
-    if (ms->io.close) ms->io.close(ms->io.ctx);
+    pthread_cond_broadcast(&ms->sync_cv);
+    pthread_mutex_unlock(&ms->state_mu);
+    if (do_close && ms->io.close) ms->io.close(ms->io.ctx);
 }
 
 void ms_destroy(MessageStream* ms) {
     ms_close(ms);
     if (ms->started) pthread_join(ms->thread, NULL);
+    /* 等重同步计时线程退出，避免 use-after-free */
+    pthread_mutex_lock(&ms->state_mu);
+    while (ms->sync_watchers > 0) pthread_cond_wait(&ms->watchers_cv, &ms->state_mu);
+    pthread_mutex_unlock(&ms->state_mu);
     free(ms->buf.data);
     pthread_mutex_destroy(&ms->send_mu);
+    pthread_mutex_destroy(&ms->state_mu);
+    pthread_cond_destroy(&ms->sync_cv);
+    pthread_cond_destroy(&ms->watchers_cv);
     free(ms);
 }

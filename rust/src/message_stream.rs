@@ -2,9 +2,10 @@
 //! 回调必须在 start() 之前设置；RpcProtocol 会自动处理。
 
 use std::io::{self, Read, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
+use std::time::Duration;
 
 pub const ERR_LENGTH_CRC_FAILED: u8 = 1;
 pub const ERR_MESSAGE_CRC_FAILED: u8 = 2;
@@ -12,8 +13,23 @@ pub const ERR_BUFFER_OVERFLOW: u8 = 3;
 
 const DEFAULT_MAX_BUFFER_SIZE: usize = 256 * 1024 * 1024;
 
+/// 带错误码的流错误（对齐 JS 修复版 ipcError 的 code 字段）。
+#[derive(Debug, Clone)]
+pub struct StreamError {
+    pub message: String,
+    pub code: String,
+}
+
+impl std::fmt::Display for StreamError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for StreamError {}
+
 type MessageCb = Box<dyn Fn(Vec<u8>) + Send>;
-type ErrorCb = Box<dyn Fn(String) + Send>;
+type ErrorCb = Box<dyn Fn(StreamError) + Send>;
 type SyncCb = Box<dyn Fn() + Send>;
 
 #[derive(Default)]
@@ -28,9 +44,14 @@ struct Shared {
     writer: Mutex<Box<dyn Write + Send>>,
     enable_crc: bool,
     max_buffer_size: usize,
+    sync_timeout_ms: u64,
     callbacks: Mutex<Callbacks>,
     closed: AtomicBool,
     started: AtomicBool,
+    protocol_mode: AtomicBool,
+    sync_generation: AtomicU64, // 重同步计时世代号，退出协议模式时递增作废旧计时
+    gate_mutex: Mutex<()>,
+    gate_cond: Condvar,
 }
 
 #[derive(Clone)]
@@ -47,9 +68,14 @@ impl MessageStream {
                 writer: Mutex::new(writer),
                 enable_crc: true,
                 max_buffer_size: DEFAULT_MAX_BUFFER_SIZE,
+                sync_timeout_ms: 3000,
                 callbacks: Mutex::new(Callbacks::default()),
                 closed: AtomicBool::new(false),
                 started: AtomicBool::new(false),
+                protocol_mode: AtomicBool::new(false),
+                sync_generation: AtomicU64::new(0),
+                gate_mutex: Mutex::new(()),
+                gate_cond: Condvar::new(),
             }),
         }
     }
@@ -65,6 +91,17 @@ impl MessageStream {
         if let Some(s) = Arc::get_mut(&mut self.shared) {
             s.enable_crc = enable;
         }
+    }
+
+    /// 设置重同步握手超时（PROTOCOL.md §4.5）；Duration::ZERO 关闭。仅在 start 前调用有效。
+    pub fn set_sync_timeout(&mut self, timeout: Duration) {
+        if let Some(s) = Arc::get_mut(&mut self.shared) {
+            s.sync_timeout_ms = timeout.as_millis() as u64;
+        }
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.shared.closed.load(Ordering::SeqCst)
     }
 
     pub fn on_message(&self, f: MessageCb) {
@@ -93,17 +130,28 @@ impl MessageStream {
         });
     }
 
-    /// 发送一个完整帧（并发安全）。
+    /// 发送一个完整帧（并发安全）。协议模式期间门控等待重同步完成（对齐 JS _syncGate）。
     pub fn send(&self, data: &[u8]) -> io::Result<()> {
-        if self.shared.closed.load(Ordering::SeqCst) {
-            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "stream closed"));
-        }
         if data.len() > self.shared.max_buffer_size {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "data size exceeds maximum buffer size",
             ));
         }
+        {
+            let mut g = self.shared.gate_mutex.lock().unwrap();
+            while self.shared.protocol_mode.load(Ordering::SeqCst) && !self.shared.closed.load(Ordering::SeqCst) {
+                g = self.shared.gate_cond.wait(g).unwrap();
+            }
+        }
+        if self.shared.closed.load(Ordering::SeqCst) {
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "stream closed"));
+        }
+        self.send_frame(data)
+    }
+
+    /// 直接写帧，不受重同步门控（错误包旁路用）。
+    fn send_frame(&self, data: &[u8]) -> io::Result<()> {
         let header_size = if self.shared.enable_crc { 8 } else { 4 };
         let mut frame = vec![0u8; header_size + data.len() + if self.shared.enable_crc { 4 } else { 0 }];
         frame[0..4].copy_from_slice(&(data.len() as u32).to_le_bytes());
@@ -120,9 +168,9 @@ impl MessageStream {
         w.write_all(&frame)
     }
 
-    /// 发送错误包（按正常帧封装的 EEEEEEEE+code）。
+    /// 发送错误包（按正常帧封装的 EEEEEEEE+code）；不受重同步门控。
     pub fn send_error(&self, code: u8) -> io::Result<()> {
-        self.send(&[0xEE, 0xEE, 0xEE, 0xEE, code])
+        self.send_frame(&[0xEE, 0xEE, 0xEE, 0xEE, code])
     }
 
     /// 发送裸协议帧（FFFFFFFF+长度+数据，无 CRC）。
@@ -137,14 +185,10 @@ impl MessageStream {
 
     pub fn close(&self) {
         self.shared.closed.store(true, Ordering::SeqCst);
+        self.shared.sync_generation.fetch_add(1, Ordering::SeqCst);
+        let _g = self.shared.gate_mutex.lock().unwrap();
+        self.shared.gate_cond.notify_all(); // 唤醒门控中的发送方，使其以关闭失败
         // 关闭底层 writer（若是 TcpStream 等可 shutdown 的类型，由调用方处理）
-    }
-
-    fn emit_error(&self, msg: &str) {
-        let cb = self.shared.callbacks.lock().unwrap();
-        if let Some(f) = &cb.on_error {
-            f(msg.to_string());
-        }
     }
 }
 
@@ -192,7 +236,7 @@ fn read_loop(mut reader: Box<dyn Read + Send>, shared: Arc<Shared>) {
         match reader.read(&mut tmp) {
             Ok(0) => {
                 if !shared.closed.load(Ordering::SeqCst) {
-                    emit_error(&shared, "stream ended");
+                    emit_error(&shared, "stream ended", "ECLOSED");
                 }
                 return;
             }
@@ -202,7 +246,7 @@ fn read_loop(mut reader: Box<dyn Read + Send>, shared: Arc<Shared>) {
             }
             Err(e) => {
                 if !shared.closed.load(Ordering::SeqCst) {
-                    emit_error(&shared, &e.to_string());
+                    emit_error(&shared, &e.to_string(), "ESOCKET");
                 }
                 return;
             }
@@ -210,10 +254,10 @@ fn read_loop(mut reader: Box<dyn Read + Send>, shared: Arc<Shared>) {
     }
 }
 
-fn emit_error(shared: &Shared, msg: &str) {
+fn emit_error(shared: &Shared, msg: &str, code: &str) {
     let cb = shared.callbacks.lock().unwrap();
     if let Some(f) = &cb.on_error {
-        f(msg.to_string());
+        f(StreamError { message: msg.to_string(), code: code.to_string() });
     }
 }
 
@@ -224,10 +268,46 @@ fn emit_message(shared: &Shared, data: Vec<u8>) {
     }
 }
 
-fn reset(st: &mut ReadState) {
+fn reset(st: &mut ReadState, shared: &Arc<Shared>) {
     st.protocol_mode = true;
     st.clear();
     st.expected_len = None;
+    shared.protocol_mode.store(true, Ordering::SeqCst);
+    let gen = shared.sync_generation.fetch_add(1, Ordering::SeqCst) + 1;
+    if shared.sync_timeout_ms > 0 {
+        let shared = shared.clone();
+        thread::spawn(move || sync_watch(shared, gen));
+    }
+}
+
+/// 退出协议模式：作废旧计时并唤醒门控中的发送方。
+fn exit_protocol_mode(st: &mut ReadState, shared: &Shared) {
+    st.protocol_mode = false;
+    shared.protocol_mode.store(false, Ordering::SeqCst);
+    shared.sync_generation.fetch_add(1, Ordering::SeqCst);
+    let _g = shared.gate_mutex.lock().unwrap();
+    shared.gate_cond.notify_all();
+}
+
+/// 重同步计时：超时仍未收到 RESET_CONFIRM 则以 ERESYNC_TIMEOUT 断链。
+fn sync_watch(shared: Arc<Shared>, gen: u64) {
+    thread::sleep(Duration::from_millis(shared.sync_timeout_ms));
+    {
+        let _g = shared.gate_mutex.lock().unwrap();
+        if gen != shared.sync_generation.load(Ordering::SeqCst)
+            || !shared.protocol_mode.load(Ordering::SeqCst)
+            || shared.closed.load(Ordering::SeqCst)
+        {
+            return;
+        }
+        shared.protocol_mode.store(false, Ordering::SeqCst);
+        shared.sync_generation.fetch_add(1, Ordering::SeqCst);
+        shared.gate_cond.notify_all();
+    }
+    emit_error(&shared, "resync handshake timeout", "ERESYNC_TIMEOUT");
+    shared.closed.store(true, Ordering::SeqCst);
+    let _g = shared.gate_mutex.lock().unwrap();
+    shared.gate_cond.notify_all();
 }
 
 fn le32(b: &[u8]) -> u32 {
@@ -237,10 +317,11 @@ fn le32(b: &[u8]) -> u32 {
 fn process_buffer(st: &mut ReadState, shared: &Arc<Shared>) {
     let ms = MessageStream { shared: shared.clone() };
     loop {
+        st.protocol_mode = shared.protocol_mode.load(Ordering::SeqCst);
         if st.len() > shared.max_buffer_size {
-            emit_error(shared, "buffer overflow");
+            emit_error(shared, "buffer overflow", "BUFFER_OVERFLOW");
             let _ = ms.send_error(ERR_BUFFER_OVERFLOW);
-            reset(st);
+            reset(st, shared);
             return;
         }
         if st.protocol_mode {
@@ -262,7 +343,7 @@ fn process_buffer(st: &mut ReadState, shared: &Arc<Shared>) {
                 let text = String::from_utf8_lossy(&st.data()[8..8 + length]).trim().to_string();
                 st.consume(8 + length);
                 if text == "RESET_CONFIRM" {
-                    st.protocol_mode = false;
+                    exit_protocol_mode(st, shared);
                     st.clear();
                     let cb = shared.callbacks.lock().unwrap();
                     if let Some(f) = &cb.on_sync_complete {
@@ -287,8 +368,8 @@ fn process_buffer(st: &mut ReadState, shared: &Arc<Shared>) {
                 let expected = le32(&st.data()[4..8]);
                 if crc32(&st.data()[0..4]) != expected {
                     let _ = ms.send_error(ERR_LENGTH_CRC_FAILED);
-                    emit_error(shared, "length header CRC check failed");
-                    reset(st);
+                    emit_error(shared, "length header CRC check failed", "LENGTH_CRC_FAILED");
+                    reset(st, shared);
                     return;
                 }
             }
@@ -300,8 +381,8 @@ fn process_buffer(st: &mut ReadState, shared: &Arc<Shared>) {
                     ERR_LENGTH_CRC_FAILED
                 };
                 let _ = ms.send_error(code);
-                emit_error(shared, &format!("invalid frame length {}", length));
-                reset(st);
+                emit_error(shared, &format!("invalid frame length {}", length), "BAD_LENGTH");
+                reset(st, shared);
                 return;
             }
             st.expected_len = Some(length as usize);
@@ -318,8 +399,8 @@ fn process_buffer(st: &mut ReadState, shared: &Arc<Shared>) {
             let expected = le32(&st.data()[expected_len..expected_len + 4]);
             if crc32(&data) != expected {
                 let _ = ms.send_error(ERR_MESSAGE_CRC_FAILED);
-                emit_error(shared, "message CRC check failed");
-                reset(st);
+                emit_error(shared, "message CRC check failed", "MESSAGE_CRC_FAILED");
+                reset(st, shared);
                 return;
             }
         }
@@ -327,9 +408,10 @@ fn process_buffer(st: &mut ReadState, shared: &Arc<Shared>) {
         st.expected_len = None;
         // 错误包可能 reset 清空缓冲区，故先消费再分发
         if data.len() == 5 && data[0..4] == [0xEE, 0xEE, 0xEE, 0xEE] {
-            reset(st);
+            emit_error(shared, "peer reported error packet", "ERESYNC");
+            reset(st, shared);
             let _ = ms.send_protocol_message(b"RESET_CONFIRM");
-            st.protocol_mode = false;
+            exit_protocol_mode(st, shared);
         } else {
             emit_message(shared, data);
         }

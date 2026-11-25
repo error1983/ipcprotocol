@@ -42,7 +42,7 @@ struct TestServer {
             auto syncP = syncPromise;
             ms->onSyncComplete = [syncP] { syncP->set_value(); };
             rpc = std::make_shared<RpcProtocol>(ms);
-            rpc->onError([](const std::string&) {});
+            rpc->onError([](const StreamError&) {});
             registerMethods(rpc);
             ready->set_value();
             // 保持服务端对象存活
@@ -97,9 +97,18 @@ static std::shared_ptr<RpcProtocol> dial(TestServer& server, std::shared_ptr<Tcp
     server.waitReady();
     connOut = conn;
     auto rpc = std::make_shared<RpcProtocol>(std::make_shared<MessageStream>(conn));
-    rpc->onError([](const std::string&) {});
+    rpc->onError([](const StreamError&) {});
     return rpc;
 }
+
+// ---- v1.1 辅助：新建一对 rpc 端点（服务端只注册 add） ----
+struct RpcPair {
+    std::shared_ptr<TcpListener> ln;
+    std::shared_ptr<RpcProtocol> server, cli;
+    std::shared_ptr<TcpStream> serverConn, cliConn;
+};
+static std::shared_ptr<RpcPair> makePair(int64_t hbInterval, int64_t hbTimeout,
+                                         const std::string& authToken, const std::string& requiredToken);
 
 int main() {
     // 1. JSON 请求 + Unicode
@@ -269,7 +278,171 @@ int main() {
         rpc->close();
     }
 
+    // ---- v1.1 用例（PROTOCOL.md §4.5/§8.1/§8.2） ----
+
+    // 10. HELLO 握手成功：token 匹配 -> ok:true，之后 RPC 正常
+    {
+        auto p = makePair(0, 0, "secret", "secret");
+        Json ack = p->cli->hello();
+        check("hello ok", ack.find("ok") && ack.find("ok")->isTruthy() &&
+                              ack.find("version")->asNum() == 1);
+        check("rpc after hello", p->cli->sendRequest("add", Json::ofArr({Json::ofNum(1), Json::ofNum(2)})).asNum() == 3);
+        p->cli->close();
+        p->server->close();
+    }
+    // 11. HELLO 错误 token -> EAUTH，服务端断链
+    {
+        auto p = makePair(0, 0, "wrong", "secret");
+        bool ok = false;
+        try {
+            p->cli->hello();
+        } catch (const RpcException& e) {
+            ok = e.code == "EAUTH" && std::string(e.what()) == "Unauthorized";
+        }
+        check("hello wrong token EAUTH", ok);
+        p->cli->close();
+        p->server->close();
+    }
+    // 12. 未握手直接请求 -> Unauthorized 错误响应 + 断链
+    {
+        auto p = makePair(0, 0, "", "secret");
+        bool ok = false;
+        try {
+            p->cli->sendRequest("add", Json::ofArr({Json::ofNum(1), Json::ofNum(2)}));
+        } catch (const RpcException& e) {
+            ok = e.remote && e.error.asStr() == "Unauthorized";
+        }
+        check("unauthorized request", ok);
+        p->cli->close();
+        p->server->close();
+    }
+    // 13. 版本不匹配：裸对端回 HELLO_ACK version=99 -> EVERSION
+    {
+        auto ln = std::make_shared<TcpListener>("127.0.0.1", 0);
+        std::thread([ln] {
+            auto conn = ln->accept();
+            auto ms = std::make_shared<MessageStream>(conn);
+            ms->onMessage = [ms](const std::vector<uint8_t>& data) {
+                std::vector<uint8_t> msg(18);
+                msg[0] = TYPE_HELLO_ACK;
+                msg[1] = CONTENT_JSON;
+                memcpy(msg.data() + 2, data.data() + 2, 16); // 回显请求 id
+                const char* body = "{\"version\":99,\"ok\":true}";
+                msg.insert(msg.end(), body, body + strlen(body));
+                ms->send(msg);
+            };
+            ms->start();
+            std::this_thread::sleep_for(std::chrono::seconds(30));
+        }).detach();
+        auto conn = tcpConnect("127.0.0.1", ln->port());
+        auto cli = std::make_shared<RpcProtocol>(std::make_shared<MessageStream>(conn), 0, 0, "", "");
+        cli->onError([](const StreamError&) {});
+        bool ok = false;
+        try {
+            cli->hello();
+        } catch (const RpcException& e) {
+            ok = e.code == "EVERSION";
+        }
+        check("version mismatch EVERSION", ok);
+        cli->close();
+    }
+    // 14. 心跳保活：短间隔 PING/PONG 交换后连接仍可用
+    {
+        auto p = makePair(100, 5000, "", "");
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        check("heartbeat keepalive", p->cli->sendRequest("add", Json::ofArr({Json::ofNum(3), Json::ofNum(4)})).asNum() == 7);
+        p->cli->close();
+        p->server->close();
+    }
+    // 15. 心跳超时：静默对端 -> EHEARTBEAT 结算 pending + 断链
+    {
+        auto ln = std::make_shared<TcpListener>("127.0.0.1", 0);
+        std::thread([ln] {
+            auto conn = ln->accept(); // 保持连接但不回任何数据
+            std::this_thread::sleep_for(std::chrono::seconds(30));
+        }).detach();
+        auto conn = tcpConnect("127.0.0.1", ln->port());
+        auto ms = std::make_shared<MessageStream>(conn);
+        auto cli = std::make_shared<RpcProtocol>(ms, 100, 300, "", "");
+        cli->onError([](const StreamError&) {});
+        bool ok = false;
+        try {
+            cli->sendRequest("add", Json::ofArr({Json::ofNum(1), Json::ofNum(2)}));
+        } catch (const RpcException& e) {
+            ok = e.code == "EHEARTBEAT";
+        }
+        check("heartbeat timeout EHEARTBEAT", ok);
+        check("heartbeat closes stream", ms->isClosed());
+        cli->close();
+    }
+    // 16. 重同步超时：坏帧对端发错误包后静默，不回 RESET_CONFIRM -> ERESYNC_TIMEOUT 断链
+    {
+        auto ln = std::make_shared<TcpListener>("127.0.0.1", 0);
+        std::thread([ln] {
+            auto conn = ln->accept();
+            const char* payload = "hello";
+            uint8_t frame[17];
+            writeLe32(frame, 5);
+            writeLe32(frame + 4, 0xDEADBEEFu);
+            memcpy(frame + 8, payload, 5);
+            writeLe32(frame + 13, crc32(reinterpret_cast<const uint8_t*>(payload), 5));
+            conn->write(frame, sizeof(frame)); // 之后保持静默，不回 RESET_CONFIRM
+            std::this_thread::sleep_for(std::chrono::seconds(30));
+        }).detach();
+        auto conn = tcpConnect("127.0.0.1", ln->port());
+        auto ms = std::make_shared<MessageStream>(conn, true, 256 * 1024 * 1024, 300);
+        auto cli = std::make_shared<RpcProtocol>(ms, 0, 0, "", "");
+        std::mutex codeMu;
+        std::vector<std::string> codes;
+        cli->onError([&](const StreamError& e) {
+            std::lock_guard<std::mutex> lock(codeMu);
+            codes.push_back(e.code);
+        });
+        bool rejected = false;
+        try {
+            cli->sendRequest("add", Json::ofArr({Json::ofNum(1), Json::ofNum(2)}));
+        } catch (const RpcException& e) {
+            rejected = e.code == "LENGTH_CRC_FAILED" || e.code == "ERESYNC_TIMEOUT";
+        }
+        check("resync pending rejected", rejected);
+        std::this_thread::sleep_for(std::chrono::milliseconds(500)); // 等满 300ms 重同步计时
+        bool gotTimeout = false;
+        {
+            std::lock_guard<std::mutex> lock(codeMu);
+            for (const auto& c : codes) if (c == "ERESYNC_TIMEOUT") gotTimeout = true;
+        }
+        check("resync timeout ERESYNC_TIMEOUT", gotTimeout);
+        check("resync timeout closes stream", ms->isClosed());
+        cli->close();
+    }
+
     printf("\n%d passed, %d failed\n", passed, failed);
     // 服务端线程 sleep 30s 会拖延退出，直接结束进程
     std::exit(failed == 0 ? 0 : 1);
+}
+
+// ---- v1.1 辅助实现 ----
+static std::shared_ptr<RpcPair> makePair(int64_t hbInterval, int64_t hbTimeout,
+                                         const std::string& authToken, const std::string& requiredToken) {
+    auto p = std::make_shared<RpcPair>();
+    p->ln = std::make_shared<TcpListener>("127.0.0.1", 0);
+    auto ready = std::make_shared<std::promise<void>>();
+    auto fut = ready->get_future();
+    std::thread([p, ready, hbInterval, hbTimeout, requiredToken] {
+        p->serverConn = p->ln->accept();
+        auto ms = std::make_shared<MessageStream>(p->serverConn);
+        p->server = std::make_shared<RpcProtocol>(ms, hbInterval, hbTimeout, "", requiredToken);
+        p->server->onError([](const StreamError&) {});
+        p->server->registerMethod("add", [](const std::vector<Json>& a) {
+            return Json::ofNum(a[0].asNum() + a[1].asNum());
+        });
+        ready->set_value();
+        std::this_thread::sleep_for(std::chrono::seconds(30)); // 保持服务端对象存活
+    }).detach();
+    p->cliConn = tcpConnect("127.0.0.1", p->ln->port());
+    auto ms = std::make_shared<MessageStream>(p->cliConn);
+    p->cli = std::make_shared<RpcProtocol>(ms, hbInterval, hbTimeout, authToken, "");
+    p->cli->onError([](const StreamError&) {});
+    fut.wait_for(std::chrono::seconds(3));
+    return p;
 }

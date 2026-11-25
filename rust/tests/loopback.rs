@@ -235,3 +235,177 @@ fn rpc_timeout() {
     assert_eq!(v.as_f64(), Some(11.0));
     rpc.close();
 }
+
+// ---- v1.1 用例（PROTOCOL.md §4.5/§8.1/§8.2） ----
+
+/// 新建一对 rpc 端点（服务端只注册 add）。
+fn pair(
+    hb_interval: Duration,
+    hb_timeout: Duration,
+    auth_token: Option<&str>,
+    required_token: Option<&str>,
+) -> (Arc<RpcProtocol>, Arc<RpcProtocol>) {
+    let ln = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = ln.local_addr().unwrap();
+    let (ready_tx, ready_rx) = mpsc::channel::<Arc<RpcProtocol>>();
+    let required = required_token.map(|s| s.to_string());
+    thread::spawn(move || {
+        let (conn, _) = ln.accept().unwrap();
+        let (r, w) = boxed_stream(&conn);
+        let server = RpcProtocol::new_with_options(MessageStream::new(r, w), hb_interval, hb_timeout, None, required);
+        server.on_error(Box::new(|_| {}));
+        server.register_method("add", Box::new(|a| {
+            Ok(Json::Num(a[0].as_f64().unwrap() + a[1].as_f64().unwrap()))
+        }));
+        let _ = ready_tx.send(server.clone());
+        std::mem::forget(conn);
+    });
+    let conn = TcpStream::connect(addr).unwrap();
+    let (r, w) = boxed_stream(&conn);
+    let cli = RpcProtocol::new_with_options(
+        MessageStream::new(r, w),
+        hb_interval,
+        hb_timeout,
+        auth_token.map(|s| s.to_string()),
+        None,
+    );
+    cli.on_error(Box::new(|_| {}));
+    let server = ready_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+    std::mem::forget(conn);
+    (cli, server)
+}
+
+#[test]
+fn hello_ok() {
+    let (cli, server) = pair(Duration::ZERO, Duration::ZERO, Some("secret"), Some("secret"));
+    let ack = cli.hello().unwrap();
+    assert_eq!(ack.get("ok").unwrap().is_truthy(), true);
+    assert_eq!(ack.get("version").unwrap().as_f64(), Some(1.0));
+    let v = cli.send_request("add", Json::Arr(vec![Json::Num(1.0), Json::Num(2.0)])).unwrap();
+    assert_eq!(v.as_f64(), Some(3.0));
+    cli.close();
+    server.close();
+}
+
+#[test]
+fn hello_wrong_token() {
+    let (cli, server) = pair(Duration::ZERO, Duration::ZERO, Some("wrong"), Some("secret"));
+    let err = cli.hello().unwrap_err();
+    assert_eq!(err.code(), "EAUTH");
+    match err {
+        RpcError::Coded { message, .. } => assert_eq!(message, "Unauthorized"),
+        _ => panic!("expected coded error"),
+    }
+    cli.close();
+    server.close();
+}
+
+#[test]
+fn unauthorized_request() {
+    let (cli, server) = pair(Duration::ZERO, Duration::ZERO, None, Some("secret"));
+    let err = cli.send_request("add", Json::Arr(vec![Json::Num(1.0), Json::Num(2.0)])).unwrap_err();
+    match err {
+        RpcError::Remote(v) => assert_eq!(v.as_str(), Some("Unauthorized")),
+        _ => panic!("expected remote error, got {:?}", err),
+    }
+    cli.close();
+    server.close();
+}
+
+#[test]
+fn hello_version_mismatch() {
+    let ln = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = ln.local_addr().unwrap();
+    thread::spawn(move || {
+        let (conn, _) = ln.accept().unwrap();
+        let (r, w) = boxed_stream(&conn);
+        let ms = MessageStream::new(r, w);
+        let ms2 = ms.clone();
+        ms.on_message(Box::new(move |data: Vec<u8>| {
+            // 裸对端：回 HELLO_ACK version=99（回显请求 id）
+            let mut msg = vec![0u8; 18];
+            msg[0] = 6; // TYPE_HELLO_ACK
+            msg[1] = 1; // CONTENT_JSON
+            msg[2..18].copy_from_slice(&data[2..18]);
+            msg.extend_from_slice(b"{\"version\":99,\"ok\":true}");
+            let _ = ms2.send(&msg);
+        }));
+        ms.start();
+        std::mem::forget(conn);
+    });
+    let conn = TcpStream::connect(addr).unwrap();
+    let (r, w) = boxed_stream(&conn);
+    let cli = RpcProtocol::new_with_options(MessageStream::new(r, w), Duration::ZERO, Duration::ZERO, None, None);
+    cli.on_error(Box::new(|_| {}));
+    let err = cli.hello().unwrap_err();
+    assert_eq!(err.code(), "EVERSION");
+    cli.close();
+    std::mem::forget(conn);
+}
+
+#[test]
+fn heartbeat_keepalive() {
+    let (cli, server) = pair(Duration::from_millis(100), Duration::from_secs(5), None, None);
+    thread::sleep(Duration::from_millis(500)); // 期间应有多轮 PING/PONG 交换
+    let v = cli.send_request("add", Json::Arr(vec![Json::Num(3.0), Json::Num(4.0)])).unwrap();
+    assert_eq!(v.as_f64(), Some(7.0));
+    cli.close();
+    server.close();
+}
+
+#[test]
+fn heartbeat_timeout() {
+    let ln = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = ln.local_addr().unwrap();
+    thread::spawn(move || {
+        let (conn, _) = ln.accept().unwrap();
+        std::mem::forget(conn); // 保持连接但不回任何数据
+    });
+    let conn = TcpStream::connect(addr).unwrap();
+    let (r, w) = boxed_stream(&conn);
+    let ms = MessageStream::new(r, w);
+    let cli = RpcProtocol::new_with_options(ms.clone(), Duration::from_millis(100), Duration::from_millis(300), None, None);
+    cli.on_error(Box::new(|_| {}));
+    let err = cli.send_request("add", Json::Arr(vec![Json::Num(1.0), Json::Num(2.0)])).unwrap_err();
+    assert_eq!(err.code(), "EHEARTBEAT");
+    assert!(ms.is_closed(), "heartbeat timeout should close stream");
+    cli.close();
+    std::mem::forget(conn);
+}
+
+#[test]
+fn resync_timeout() {
+    let ln = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = ln.local_addr().unwrap();
+    thread::spawn(move || {
+        let (mut conn, _) = ln.accept().unwrap();
+        let payload = b"hello";
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        frame.extend_from_slice(&0xDEADBEEFu32.to_le_bytes());
+        frame.extend_from_slice(payload);
+        frame.extend_from_slice(&ipcprotocol::message_stream::crc32(payload).to_le_bytes());
+        let _ = conn.write_all(&frame); // 之后保持静默，不回 RESET_CONFIRM
+        std::mem::forget(conn);
+    });
+    let conn = TcpStream::connect(addr).unwrap();
+    let (r, w) = boxed_stream(&conn);
+    let mut ms = MessageStream::new(r, w);
+    ms.set_sync_timeout(Duration::from_millis(300));
+    let cli = RpcProtocol::new_with_options(ms.clone(), Duration::ZERO, Duration::ZERO, None, None);
+    let (code_tx, code_rx) = mpsc::channel::<String>();
+    cli.on_error(Box::new(move |e| {
+        let _ = code_tx.send(e.code);
+    }));
+    let err = cli.send_request("add", Json::Arr(vec![Json::Num(1.0), Json::Num(2.0)])).unwrap_err();
+    assert!(err.code() == "LENGTH_CRC_FAILED" || err.code() == "ERESYNC_TIMEOUT", "got {}", err.code());
+    loop {
+        let code = code_rx.recv_timeout(Duration::from_secs(2)).expect("ERESYNC_TIMEOUT not emitted");
+        if code == "ERESYNC_TIMEOUT" {
+            break;
+        }
+    }
+    assert!(ms.is_closed(), "resync timeout should close stream");
+    cli.close();
+    std::mem::forget(conn);
+}

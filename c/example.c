@@ -86,7 +86,7 @@ static JsonValue* h_push(void* u, JsonValue** a, size_t n, char** err) {
     return json_str("sent");
 }
 
-static void silent_error(void* u, const char* msg) { (void)u; (void)msg; }
+static void silent_error(void* u, const char* msg, const char* code) { (void)u; (void)msg; (void)code; }
 
 static void register_methods(RpcProtocol* rpc) {
     rpc_register(rpc, "add", h_add, NULL);

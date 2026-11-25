@@ -24,10 +24,23 @@ namespace ipc {
 constexpr uint8_t TYPE_REQUEST = 0;
 constexpr uint8_t TYPE_RESPONSE = 1;
 constexpr uint8_t TYPE_EVENT = 2;
+constexpr uint8_t TYPE_PING = 3;
+constexpr uint8_t TYPE_PONG = 4;
+constexpr uint8_t TYPE_HELLO = 5;
+constexpr uint8_t TYPE_HELLO_ACK = 6;
 
 constexpr uint8_t CONTENT_TEXT = 0;
 constexpr uint8_t CONTENT_JSON = 1;
 constexpr uint8_t CONTENT_BINARY = 2;
+
+// 线协议版本（HELLO 协商用）。
+constexpr double PROTOCOL_VERSION = 1.0;
+
+inline int64_t nowMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
 
 // RPC 错误：remote=true 时 error 携带对端原始 error 值（对齐 JS reject(response.error)）；
 // code 为错误码（如 ETIMEDOUT/EREMOTE）。
@@ -48,17 +61,31 @@ using Handler = std::function<Json(const std::vector<Json>&)>;
 
 class RpcProtocol {
 public:
-    // 包装消息流：先注册回调再启动读循环，避免早到消息丢失。
-    explicit RpcProtocol(std::shared_ptr<MessageStream> ms) : state_(std::make_shared<State>()), ms_(std::move(ms)) {
+    // 包装消息流（默认心跳 5s/15s，不鉴权）：先注册回调再启动读循环，避免早到消息丢失。
+    explicit RpcProtocol(std::shared_ptr<MessageStream> ms)
+        : RpcProtocol(std::move(ms), 5000, 15000, "", "") {}
+
+    // heartbeatIntervalMs <=0 关闭心跳；requiredToken 非空时未通过 HELLO 鉴权的请求被拒绝。
+    RpcProtocol(std::shared_ptr<MessageStream> ms, int64_t heartbeatIntervalMs, int64_t heartbeatTimeoutMs,
+                std::string authToken, std::string requiredToken)
+        : state_(std::make_shared<State>()), ms_(std::move(ms)), authToken_(std::move(authToken)) {
+        state_->requiredToken = std::move(requiredToken);
+        state_->authenticated.store(state_->requiredToken.empty());
+        state_->lastReceived.store(nowMs());
         auto state = state_;
         auto msCopy = ms_;
         ms_->onMessage = [state, msCopy](const std::vector<uint8_t>& data) { handleMessage(data, state, msCopy); };
-        ms_->onError = [state](const std::string& msg) {
-            rejectAll(state, "Request failed: " + msg);
+        ms_->onError = [state](const StreamError& e) {
+            rejectAll(state, "Request failed: " + e.message, e.code);
             std::lock_guard<std::mutex> lock(state->mu);
-            if (state->onError) state->onError(msg);
+            if (state->onError) state->onError(e);
         };
         ms_->start();
+        if (heartbeatIntervalMs > 0) {
+            std::thread([state, msCopy, heartbeatIntervalMs, heartbeatTimeoutMs] {
+                heartbeatLoop(state, msCopy, heartbeatIntervalMs, heartbeatTimeoutMs);
+            }).detach();
+        }
     }
 
     ~RpcProtocol() { close(); }
@@ -77,7 +104,7 @@ public:
         state_->onEvent = std::move(cb);
     }
 
-    void onError(std::function<void(const std::string&)> cb) {
+    void onError(std::function<void(const StreamError&)> cb) {
         std::lock_guard<std::mutex> lock(state_->mu);
         state_->onError = std::move(cb);
     }
@@ -141,9 +168,30 @@ public:
     // 销毁：拒绝所有 pending 并关闭流。
     void close() {
         bool expected = false;
-        if (!closed_.compare_exchange_strong(expected, true)) return;
+        if (!state_->closed.compare_exchange_strong(expected, true)) return;
         rejectAll(state_, "RPC Protocol destroyed");
         ms_->close();
+    }
+
+    // ---- v1.1: HELLO 握手 ----
+
+    // 发起 HELLO 握手；ACK error → EAUTH，版本不符 → EVERSION。timeoutMs 语义同 sendRequest。
+    Json hello(int64_t timeoutMs = -1) {
+        std::string id = newUUID();
+        auto pending = std::make_shared<Pending>();
+        {
+            std::lock_guard<std::mutex> lock(state_->mu);
+            state_->pending[id] = pending;
+        }
+        Json payload = Json::object().set("version", Json::ofNum(PROTOCOL_VERSION));
+        if (!authToken_.empty()) payload.set("token", Json::ofStr(authToken_));
+        std::string body = payload.dump();
+        if (!ms_->send(buildMessage(TYPE_HELLO, CONTENT_JSON, id,
+                                    reinterpret_cast<const uint8_t*>(body.data()), body.size()))) {
+            removePending(id);
+            throw RpcException("send failed");
+        }
+        return waitResult(id, pending, "hello", timeoutMs);
     }
 
 private:
@@ -160,12 +208,17 @@ private:
         std::map<std::string, Handler> handlers;
         std::map<std::string, std::shared_ptr<Pending>> pending;
         std::function<void(uint8_t, Json)> onEvent;
-        std::function<void(const std::string&)> onError;
+        std::function<void(const StreamError&)> onError;
+        // ---- v1.1: 心跳与 HELLO 握手（PROTOCOL.md §8.1/§8.2） ----
+        std::atomic<bool> closed{false};
+        std::atomic<bool> authenticated{true};
+        std::atomic<int64_t> lastReceived{0};
+        std::string requiredToken;
     };
 
     std::shared_ptr<State> state_;
-    std::atomic<bool> closed_{false};
     std::atomic<int64_t> defaultTimeoutMs_{15000};
+    std::string authToken_;
     std::shared_ptr<MessageStream> ms_; // 最后声明：析构时先停读线程
 
     void removePending(const std::string& id) {
@@ -200,15 +253,41 @@ private:
         return value;
     }
 
-    static void rejectAll(const std::shared_ptr<State>& state, const std::string& msg) {
+    static void rejectAll(const std::shared_ptr<State>& state, const std::string& msg,
+                          const std::string& code = "") {
         std::lock_guard<std::mutex> lock(state->mu);
         for (auto& [id, p] : state->pending) {
             std::lock_guard<std::mutex> pl(p->mu);
-            p->err = std::make_unique<RpcException>(msg);
+            p->err = std::make_unique<RpcException>(msg, code);
             p->done = true;
             p->cv.notify_all();
         }
         state->pending.clear();
+    }
+
+    // 心跳节拍：静默超过 timeout 以 EHEARTBEAT 结算全部 pending 并断链；否则按间隔发 PING。
+    static void heartbeatLoop(const std::shared_ptr<State>& state, const std::shared_ptr<MessageStream>& ms,
+                              int64_t intervalMs, int64_t timeoutMs) {
+        for (;;) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(intervalMs));
+            if (state->closed.load()) return;
+            int64_t silent = nowMs() - state->lastReceived.load();
+            if (timeoutMs > 0 && silent >= timeoutMs) {
+                std::string msg = "heartbeat timeout: no data for " + std::to_string(silent) + "ms";
+                rejectAll(state, msg, "EHEARTBEAT");
+                {
+                    std::lock_guard<std::mutex> lock(state->mu);
+                    if (state->onError) state->onError(StreamError{msg, "EHEARTBEAT"});
+                }
+                bool expected = false;
+                if (state->closed.compare_exchange_strong(expected, true)) ms->close();
+                return;
+            }
+            if (silent >= intervalMs) {
+                ms->send(buildMessage(TYPE_PING, CONTENT_TEXT, newUUID(),
+                                      reinterpret_cast<const uint8_t*>(""), 0));
+            }
+        }
     }
 
     static void deliver(const std::shared_ptr<Pending>& p, Json value, std::unique_ptr<RpcException> err) {
@@ -224,9 +303,11 @@ private:
         if (data.size() < 18) return;
         uint8_t msgType = data[0];
         uint8_t contentType = data[1];
+        if (msgType > 6) return;
         std::string id = bytesToUUID(data.data() + 2);
         const uint8_t* payload = data.data() + 18;
         size_t payloadLen = data.size() - 18;
+        state->lastReceived.store(nowMs()); // 任何入站消息都刷新心跳基准
 
         Json content;
         try {
@@ -240,6 +321,12 @@ private:
         }
 
         if (msgType == TYPE_REQUEST) {
+            if (!state->authenticated.load()) {
+                sendErrorResponse(ms, id, "Unauthorized");
+                bool expected = false;
+                if (state->closed.compare_exchange_strong(expected, true)) ms->close();
+                return;
+            }
             std::vector<uint8_t> raw(payload, payload + payloadLen);
             std::thread([state, ms, id, contentType, content, raw]() mutable {
                 handleRequest(id, contentType, content, raw, state, ms);
@@ -263,9 +350,83 @@ private:
                 }
             }
         } else if (msgType == TYPE_EVENT) {
+            if (!state->authenticated.load()) return; // 未鉴权事件直接丢弃
             std::lock_guard<std::mutex> lock(state->mu);
             if (state->onEvent) state->onEvent(contentType, std::move(content));
+        } else if (msgType == TYPE_PING) {
+            ms->send(buildMessage(TYPE_PONG, CONTENT_TEXT, id,
+                                  reinterpret_cast<const uint8_t*>(""), 0));
+        } else if (msgType == TYPE_PONG) {
+            // 仅刷新 lastReceived（上面已做）
+        } else if (msgType == TYPE_HELLO) {
+            handleHello(id, content, state, ms);
+        } else if (msgType == TYPE_HELLO_ACK) {
+            std::shared_ptr<Pending> p;
+            {
+                std::lock_guard<std::mutex> lock(state->mu);
+                auto it = state->pending.find(id);
+                if (it != state->pending.end()) {
+                    p = it->second;
+                    state->pending.erase(it);
+                }
+            }
+            if (p) deliverHelloAck(p, content);
         }
+    }
+
+    // 服务端 HELLO 处理：版本/token 校验，失败回 error ACK 后断链。
+    static void handleHello(const std::string& id, const Json& content, const std::shared_ptr<State>& state,
+                            const std::shared_ptr<MessageStream>& ms) {
+        Json ack = Json::object().set("version", Json::ofNum(PROTOCOL_VERSION));
+        bool ok = false;
+        if (content.type == Json::Type::Obj) {
+            const Json* v = content.find("version");
+            if (!v || v->type != Json::Type::Num || v->number != PROTOCOL_VERSION) {
+                ack.set("error", Json::ofStr("Unsupported protocol version"));
+            } else if (!state->requiredToken.empty()) {
+                const Json* t = content.find("token");
+                if (!t || t->type != Json::Type::Str || t->str != state->requiredToken) {
+                    ack.set("error", Json::ofStr("Unauthorized"));
+                } else {
+                    state->authenticated.store(true);
+                    ack.set("ok", Json::ofBool(true));
+                    ok = true;
+                }
+            } else {
+                state->authenticated.store(true);
+                ack.set("ok", Json::ofBool(true));
+                ok = true;
+            }
+        } else {
+            ack.set("error", Json::ofStr("Invalid hello payload"));
+        }
+        std::string body = ack.dump();
+        ms->send(buildMessage(TYPE_HELLO_ACK, CONTENT_JSON, id,
+                              reinterpret_cast<const uint8_t*>(body.data()), body.size()));
+        if (!ok) {
+            bool expected = false;
+            if (state->closed.compare_exchange_strong(expected, true)) ms->close();
+        }
+    }
+
+    // 客户端 HELLO_ACK 解析：error → EAUTH，版本不符 → EVERSION。
+    static void deliverHelloAck(const std::shared_ptr<Pending>& p, const Json& content) {
+        if (content.type != Json::Type::Obj) {
+            deliver(p, Json::null(), std::make_unique<RpcException>("Invalid hello ack payload", "EAUTH"));
+            return;
+        }
+        const Json* ev = content.find("error");
+        if (ev && ev->isTruthy()) {
+            std::string msg = ev->type == Json::Type::Str ? ev->str : ev->dump();
+            deliver(p, Json::null(), std::make_unique<RpcException>(msg, "EAUTH"));
+            return;
+        }
+        const Json* v = content.find("version");
+        if (!v || v->type != Json::Type::Num || v->number != PROTOCOL_VERSION) {
+            deliver(p, Json::null(), std::make_unique<RpcException>("Unsupported protocol version", "EVERSION"));
+            return;
+        }
+        deliver(p, content, nullptr);
     }
 
     static void sendErrorResponse(const std::shared_ptr<MessageStream>& ms, const std::string& id,

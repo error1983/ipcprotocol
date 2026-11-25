@@ -23,7 +23,7 @@ import java.util.concurrent.TimeUnit;
  * RpcProtocol.js 的 Java 移植版（线格式完全兼容，Java 11+，零依赖）。
  *
  * 消息格式: [type u8][contentType u8][UUID 16B][payload...]
- *   type:        0=REQUEST, 1=RESPONSE, 2=EVENT
+ *   type:        0=REQUEST, 1=RESPONSE, 2=EVENT, 3=PING, 4=PONG, 5=HELLO, 6=HELLO_ACK
  *   contentType: 0=TEXT(utf8), 1=JSON(utf8), 2=BINARY(原始字节)
  * JSON 请求体: {"method":...,"params":...,"to":...(可选)}；错误响应体: {"error":...}
  * 二进制请求体: [methodLen u32BE][method utf8][paramsLen u32BE][params JSON utf8][binary...]
@@ -34,7 +34,10 @@ import java.util.concurrent.TimeUnit;
 public class RpcProtocol implements Closeable {
 
     public static final int TYPE_REQUEST = 0, TYPE_RESPONSE = 1, TYPE_EVENT = 2;
+    public static final int TYPE_PING = 3, TYPE_PONG = 4, TYPE_HELLO = 5, TYPE_HELLO_ACK = 6;
     public static final int CONTENT_TEXT = 0, CONTENT_JSON = 1, CONTENT_BINARY = 2;
+    /** 线协议版本（HELLO 协商用）。 */
+    public static final long PROTOCOL_VERSION = 1;
 
     /** 方法处理器，返回值映射: null->JSON null, String->TEXT, byte[]->BINARY, 其他->JSON。 */
     public interface Handler { Object handle(Object[] args) throws Exception; }
@@ -75,9 +78,35 @@ public class RpcProtocol implements Closeable {
     private volatile long defaultTimeoutMs = 15000;
     private volatile boolean closed = false;
 
+    // ---- v1.1: 心跳与 HELLO 握手（对齐 PROTOCOL.md §8.1/§8.2） ----
+    private final long heartbeatIntervalMs;
+    private final long heartbeatTimeoutMs;
+    private final String authToken;
+    private final String requiredToken;
+    private volatile long lastReceivedMs;
+    private volatile boolean authenticated;
+    private ScheduledFuture<?> heartbeatTask;
+
     public RpcProtocol(MessageStream messageStream) {
+        this(messageStream, 5000, 15000, null, null);
+    }
+
+    /**
+     * @param heartbeatIntervalMs 心跳发送间隔（毫秒），<=0 关闭心跳
+     * @param heartbeatTimeoutMs  静默超时（毫秒），超时以 EHEARTBEAT 断链；<=0 关闭
+     * @param authToken           客户端 HELLO 携带的鉴权令牌（可选）
+     * @param requiredToken       服务端要求的令牌；非 null 时未通过 HELLO 鉴权的请求被拒绝
+     */
+    public RpcProtocol(MessageStream messageStream, long heartbeatIntervalMs, long heartbeatTimeoutMs,
+                       String authToken, String requiredToken) {
         if (messageStream == null) throw new IllegalArgumentException("messageStream is undefined");
         this.messageStream = messageStream;
+        this.heartbeatIntervalMs = heartbeatIntervalMs;
+        this.heartbeatTimeoutMs = heartbeatTimeoutMs;
+        this.authToken = authToken;
+        this.requiredToken = requiredToken;
+        this.authenticated = requiredToken == null;
+        this.lastReceivedMs = System.currentTimeMillis();
         messageStream.addMessageListener(this::handleMessage);
         messageStream.addErrorListener(err -> {
             handleStreamError(err);
@@ -85,6 +114,34 @@ public class RpcProtocol implements Closeable {
         });
         // 先挂好监听器再启动读循环，避免早到消息在注册前被分发的竞态
         messageStream.start();
+        if (heartbeatIntervalMs > 0) {
+            heartbeatTask = timeoutScheduler.scheduleWithFixedDelay(
+                    this::heartbeatTick, heartbeatIntervalMs, heartbeatIntervalMs, TimeUnit.MILLISECONDS);
+        }
+    }
+
+    /** 心跳节拍：静默超过 timeout 则以 EHEARTBEAT 结算全部 pending 并断链；否则按间隔发 PING。 */
+    private void heartbeatTick() {
+        if (closed) return;
+        long silent = System.currentTimeMillis() - lastReceivedMs;
+        if (heartbeatTimeoutMs > 0 && silent >= heartbeatTimeoutMs) {
+            RpcException err = new RpcException("heartbeat timeout: no data for " + silent + "ms", "EHEARTBEAT");
+            rejectAll(err);
+            emitError(err);
+            close();
+            return;
+        }
+        if (silent >= heartbeatIntervalMs) {
+            try { sendRaw(TYPE_PING, CONTENT_TEXT, UUID.randomUUID().toString(), ""); }
+            catch (IOException ignored) { }
+        }
+    }
+
+    private void rejectAll(RpcException err) {
+        for (String id : new ArrayList<>(pendingRequests.keySet())) {
+            CompletableFuture<Object> pending = pendingRequests.remove(id);
+            if (pending != null) pending.completeExceptionally(err);
+        }
     }
 
     // ========== 事件 ==========
@@ -113,9 +170,11 @@ public class RpcProtocol implements Closeable {
 
     private void handleStreamError(Exception error) {
         String message = error.getMessage() != null ? error.getMessage() : "Connection error";
+        String code = error instanceof MessageStream.StreamException
+                ? ((MessageStream.StreamException) error).getCode() : null;
         for (String id : new ArrayList<>(pendingRequests.keySet())) {
             CompletableFuture<Object> pending = pendingRequests.remove(id);
-            if (pending != null) pending.completeExceptionally(new RpcException("Request failed: " + message));
+            if (pending != null) pending.completeExceptionally(new RpcException("Request failed: " + message, code));
         }
     }
 
@@ -212,15 +271,26 @@ public class RpcProtocol implements Closeable {
     private void handleMessage(byte[] buffer) {
         try {
             Message msg = deserialize(buffer);
-            if (msg.type < 0 || msg.type > 2) throw new IOException("Invalid message type: " + msg.type);
+            if (msg.type < 0 || msg.type > 6) throw new IOException("Invalid message type: " + msg.type);
             if (msg.contentType < 0 || msg.contentType > 2) throw new IOException("Invalid content type: " + msg.contentType);
+            lastReceivedMs = System.currentTimeMillis();   // 任何入站消息都刷新心跳基准
 
             if (msg.type == TYPE_REQUEST) {
+                if (!authenticated) { rejectUnauthorized(msg.id); return; }
                 executor.submit(() -> handleRequest(msg.id, msg.content));
             } else if (msg.type == TYPE_RESPONSE) {
                 handleResponse(msg.id, msg.content);
-            } else {
+            } else if (msg.type == TYPE_EVENT) {
+                if (!authenticated) return;   // 未鉴权事件直接丢弃
                 emitEvent(msg.contentType, msg.content);
+            } else if (msg.type == TYPE_PING) {
+                sendPong(msg.id);
+            } else if (msg.type == TYPE_PONG) {
+                // 仅刷新 lastReceived（上面已做）
+            } else if (msg.type == TYPE_HELLO) {
+                handleHello(msg.id, msg.content);
+            } else {
+                handleHelloAck(msg.id, msg.content);
             }
         } catch (Exception err) {
             System.err.println("Failed to handle message: " + err.getMessage());
@@ -313,6 +383,89 @@ public class RpcProtocol implements Closeable {
         if (v instanceof String) return !((String) v).isEmpty();
         if (v instanceof Number) return ((Number) v).doubleValue() != 0;
         return true;
+    }
+
+    // ========== v1.1: 心跳与 HELLO 握手 ==========
+
+    private void sendPong(String id) {
+        try { sendRaw(TYPE_PONG, CONTENT_TEXT, id, ""); }
+        catch (IOException err) { System.err.println("Failed to send pong: " + err.getMessage()); }
+    }
+
+    /** 未鉴权 REQUEST：回 Unauthorized 错误响应后断链（对齐 PROTOCOL.md §8.2）。 */
+    private void rejectUnauthorized(String id) {
+        Map<String, Object> error = new LinkedHashMap<>();
+        error.put("error", "Unauthorized");
+        sendResponse(id, error, CONTENT_JSON);
+        close();
+    }
+
+    @SuppressWarnings("unchecked")
+    private void handleHello(String id, Object content) {
+        Map<String, Object> ack = new LinkedHashMap<>();
+        ack.put("version", PROTOCOL_VERSION);
+        boolean ok = false;
+        if (content instanceof Map) {
+            Map<String, Object> map = (Map<String, Object>) content;
+            Object version = map.get("version");
+            if (!(version instanceof Number) || ((Number) version).longValue() != PROTOCOL_VERSION) {
+                ack.put("error", "Unsupported protocol version");
+            } else if (requiredToken != null && !requiredToken.equals(map.get("token"))) {
+                ack.put("error", "Unauthorized");
+            } else {
+                authenticated = true;
+                ack.put("ok", true);
+                ok = true;
+            }
+        } else {
+            ack.put("error", "Invalid hello payload");
+        }
+        try { sendRaw(TYPE_HELLO_ACK, CONTENT_JSON, id, ack); }
+        catch (IOException err) { System.err.println("Failed to send hello ack: " + err.getMessage()); }
+        if (!ok) close();   // 握手失败后服务端断链
+    }
+
+    @SuppressWarnings("unchecked")
+    private void handleHelloAck(String id, Object content) {
+        CompletableFuture<Object> pending = pendingRequests.remove(id);
+        if (pending == null) return;
+        if (!(content instanceof Map)) {
+            pending.completeExceptionally(new RpcException("Invalid hello ack payload", "EAUTH"));
+            return;
+        }
+        Map<String, Object> map = (Map<String, Object>) content;
+        if (isTruthy(map.get("error"))) {
+            pending.completeExceptionally(new RpcException(map.get("error"), "EAUTH"));
+            return;
+        }
+        Object version = map.get("version");
+        if (!(version instanceof Number) || ((Number) version).longValue() != PROTOCOL_VERSION) {
+            pending.completeExceptionally(new RpcException("Unsupported protocol version", "EVERSION"));
+            return;
+        }
+        pending.complete(content);
+    }
+
+    /** 发起 HELLO 握手（默认超时）；ACK error → EAUTH，版本不符 → EVERSION。 */
+    public CompletableFuture<Object> hello() {
+        return hello(defaultTimeoutMs);
+    }
+
+    public CompletableFuture<Object> hello(long timeoutMs) {
+        String id = UUID.randomUUID().toString();
+        CompletableFuture<Object> future = new CompletableFuture<>();
+        pendingRequests.put(id, future);
+        armTimeout(id, future, "hello", timeoutMs);
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("version", PROTOCOL_VERSION);
+        if (authToken != null) payload.put("token", authToken);
+        try {
+            sendRaw(TYPE_HELLO, CONTENT_JSON, id, payload);
+        } catch (IOException err) {
+            pendingRequests.remove(id);
+            future.completeExceptionally(err);
+        }
+        return future;
     }
 
     // ========== 发送 ==========
@@ -416,6 +569,7 @@ public class RpcProtocol implements Closeable {
     public void close() {
         if (closed) return;
         closed = true;
+        if (heartbeatTask != null) heartbeatTask.cancel(false);
         for (String id : new ArrayList<>(pendingRequests.keySet())) {
             CompletableFuture<Object> pending = pendingRequests.remove(id);
             if (pending != null) pending.completeExceptionally(new RpcException("RPC Protocol destroyed"));

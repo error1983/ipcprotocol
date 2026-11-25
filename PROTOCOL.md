@@ -3,7 +3,7 @@
 本文档定义 `MessageStream.js` / `RpcProtocol.js` 所用协议的**线格式（wire format）与行为语义**，
 作为 Node.js / Python / C# / Java / Go / Rust / C++ / C 各实现的唯一互操作依据。
 
-- 规格版本：1.0（与仓库内 JS 原版行为一致）
+- 规格版本：1.1（v1.0 线格式不变；v1.1 新增消息类型 3–6、心跳、可选 HELLO 握手、重同步超时断链，见 §4.5、§8.1、§8.2）
 - 字节序约定：除特别注明外，长度字段为**小端（LE）**；二进制请求体内的长度字段为**大端（BE）**
 - 文本编码：一律 UTF-8
 - 传输层：协议与传输无关，可运行于任意双向字节流（TCP、命名管道、WebSocket 二进制帧等）。
@@ -190,6 +190,18 @@ A（检测端）                          B（对端）
 - A 在协议模式下会丢弃一切非协议数据，因此 B 在握手期间不应发送正常业务帧。
 - `BUFFER_OVERFLOW` 同样走 `sendError + reset()` 流程。
 
+### 4.5 重同步超时断链与发送门控（v1.1，全语言必须实现）
+
+- `syncTimeout` 默认 **3000ms**，可配置；`<=0` 关闭超时（保持 v1.0 无限等待行为）。
+- 进入协议模式时启动计时；收到 `RESET_CONFIRM` 或流关闭时取消。
+- 超时触发：上报错误码 **`ERESYNC_TIMEOUT`**，随后**关闭流**（半开/恶意对端不再无限占用资源）；
+  RPC 层随之结算全部在途请求。
+- **发送门控**：协议模式期间，普通业务帧的 `send()` 必须等待重同步完成后再写；
+  超时/关闭时以 `ERESYNC`/`ECLOSED` 失败。错误包与协议消息（RESET_CONFIRM）不受门控。
+- **流错误结算在途请求**：RPC 层收到帧层任何 `error`（含 `ERESYNC`、CRC 失败、
+  `ERESYNC_TIMEOUT`、`EHEARTBEAT`）时，必须拒绝全部 pending（错误码透传），与 JS 版
+  `handleStreamError → _rejectAll` 一致。
+
 ---
 
 ## 5. RpcProtocol：消息层
@@ -211,6 +223,10 @@ A（检测端）                          B（对端）
 | 0 | REQUEST | 调用方 → 服务方 |
 | 1 | RESPONSE | 服务方 → 调用方（id 与请求一致） |
 | 2 | EVENT | 单向通知，无响应 |
+| 3 | PING | 双向，心跳探测（§8.1），收到即回 PONG |
+| 4 | PONG | 双向，心跳应答（§8.1），id 回显 PING 的 id |
+| 5 | HELLO | 客户端 → 服务端，握手（§8.2） |
+| 6 | HELLO_ACK | 服务端 → 客户端，握手应答（§8.2），id 回显 HELLO 的 id |
 
 **contentType**
 
@@ -244,7 +260,7 @@ UUID "01234567-89ab-cdef-0123-456789abcdef"
 ### 5.2 反序列化校验
 
 - 消息长度 < 18 → 错误。
-- `type` ∉ {0,1,2} 或 `contentType` ∉ {0,1,2} → 错误。
+- `type` ∉ {0,1,2,3,4,5,6} 或 `contentType` ∉ {0,1,2} → 错误。
 - JSON 解析失败 → 错误。
 - 处理失败的消息**记录日志后丢弃**，不影响后续消息（不中断连接）。
 
@@ -297,7 +313,7 @@ UUID "01234567-89ab-cdef-0123-456789abcdef"
 ### 6.5 pending 请求生命周期
 
 - 发送失败（流不可写等）→ 立即移除并以发送异常拒绝。
-- 底层流 `error` → **拒绝所有** pending，错误消息形如 `Request failed: <原始错误消息>`。
+- 底层流 `error` → **拒绝所有** pending，错误码透传（含 `ERESYNC`/`ERESYNC_TIMEOUT`/`EHEARTBEAT`，见 §4.5）。
 - `destroy()/close()` → 拒绝所有 pending，错误消息 `RPC Protocol destroyed`，并清理流与处理器。
 
 ---
@@ -333,6 +349,57 @@ sendRequestBinary("upload", <75KB bytes>, "tag-1")
 - 辅助发送：`sendText(str)` → TEXT；`sendJson(obj)` → JSON；`sendBinary(bytes)` → BINARY。
 - 接收方向上层触发 `event`，携带 `{contentType, content}`；**不回响应**。
 - 事件与请求/响应共用同一条流与帧层，天然保序。
+
+### 8.1 心跳 PING/PONG（v1.1，半开连接检测）
+
+线格式：18 字节标准头，`type=3(PING)/4(PONG)`，`contentType=0(TEXT)`，**payload 为空**。
+PING 的 id 为随机 UUID；PONG 的 id **回显所应答 PING 的 id**。
+
+行为语义（RPC 层实现）：
+
+- 配置：`heartbeatIntervalMs` 默认 **5000**，`heartbeatTimeoutMs` 默认 **15000**；
+  `interval<=0` 关闭心跳（v1.0 行为）。建议 `timeout >= 2×interval`。
+- 维护 `lastReceived` = 最近一次收到**任何消息**的时刻（初始为构造时刻）。
+- 后台定时检查（周期≈interval）：
+  - 静默时长 ≥ `heartbeatTimeoutMs` → 上报错误码 **`EHEARTBEAT`**、结算全部在途请求、关闭连接；
+  - 否则静默时长 ≥ `heartbeatIntervalMs` → 发送 PING。
+- 收到 PING → 立即回 PONG（回显 id）；收到 PONG → 仅刷新 `lastReceived`，不交付应用层。
+- PING/PONG **不受 HELLO 鉴权门禁**（存活探测不携带业务信息）。
+- 发送的 PING 不算接收活动；只有入站数据刷新 `lastReceived`。
+
+兼容性：旧实现收到未知类型 3/4 会按 §5.2 记录 `EMALFORMED` 后丢弃（不崩溃、不断链），
+但不会回 PONG；与旧实现互通时应关闭心跳（`interval<=0`）。
+
+### 8.2 可选 HELLO 握手：版本协商 + 预共享 token 鉴权（v1.1）
+
+线格式：`type=5(HELLO)/6(HELLO_ACK)`，`contentType=1(JSON)`，id 规则同请求/响应
+（HELLO 随机 UUID，HELLO_ACK 回显）。
+
+```
+HELLO     payload = {"version": 1, "token": "<可选字符串>"}
+HELLO_ACK payload = {"version": 1, "ok": true}          // 成功
+HELLO_ACK payload = {"error": "<原因>"}                  // 失败，服务端随后关闭连接
+```
+
+服务端：
+
+- 配置 `requiredToken`（默认 null/空 = 不启用鉴权门禁）。
+- 收到 HELLO：`version != 1` → ACK `{"error":"unsupported protocol version: <v>"}` + 关闭；
+  `requiredToken` 已配置且 token 不匹配（含缺失）→ ACK `{"error":"unauthorized"}` + 关闭；
+  否则标记本连接已鉴权，ACK `{"version":1,"ok":true}`。
+- `requiredToken` 已配置时，未鉴权连接的 **REQUEST** → 错误响应 `{"error":"Unauthorized"}` + 关闭；
+  EVENT 丢弃。PING/HELLO 始终允许。
+- 未配置 `requiredToken` 时不门禁任何请求（向后兼容），但仍应答 HELLO（含版本校验）。
+
+客户端：
+
+- 配置 `authToken`（可选）；显式调用 `hello(timeoutMs)` 发送 HELLO 并等待 ACK
+  （pending 跟踪，超时走 `ETIMEDOUT`）。
+- ACK 含 `error` → 抛 `RpcError`，错误码 **`EAUTH`**；ACK 的 `version != 1` → **`EVERSION`**。
+- 库**不自动**拦截未握手请求；启用鉴权时调用方必须先 `await hello()` 再发业务请求。
+
+兼容性：默认不启用鉴权、不自动握手，v1.0 调用方零改动；旧服务端收到 HELLO 会回
+`Method not found` 类错误（按未知类型丢弃），启用鉴权的客户端不应连旧服务端。
 
 ---
 
@@ -454,6 +521,14 @@ sendRequestBinary("upload", <75KB bytes>, "tag-1")
 - [ ] 接收端：清状态 → 发 RESET_CONFIRM（裸帧 FFFFFFFF）→ 立即回正常模式
 - [ ] 协议模式下丢弃非协议数据；RESET_CONFIRM 后触发 syncComplete
 - [ ] 重同步后业务通信可继续
+- [ ] syncTimeout（默认 3s）超时 → ERESYNC_TIMEOUT + 断链；协议模式期间发送门控（§4.5）
+- [ ] 流错误（含 ERESYNC）结算全部 pending（§4.5）
+
+**心跳与握手（v1.1）**
+- [ ] PING/PONG：type 3/4、TEXT 空载荷、PONG 回显 id；空闲发 PING、静默超限 EHEARTBEAT 断链（§8.1）
+- [ ] 心跳可配置可关闭；只有入站数据刷新 lastReceived
+- [ ] HELLO/HELLO_ACK：type 5/6、JSON；版本校验、可选 token 门禁、失败后断链（§8.2）
+- [ ] 未配置 requiredToken 时不门禁请求；客户端 hello() 显式调用，EAUTH/EVERSION 错误码
 
 **消息层**
 - [ ] 18 字节头；UUID 字节序正确（C# 不用 Guid.ToByteArray 默认序）
