@@ -1,0 +1,19 @@
+node_modules
+.DS_Store
+build
+coverage
+.env
+*.log
+*/*/bin
+*/*/obj
+*/temp
+*/out
+*/__pycache__
+
+# 构建产物（任意层级）
+**/bin/
+**/obj/
+**/out/
+**/__pycache__/
+*.pyc
+java/dbg*.txt
