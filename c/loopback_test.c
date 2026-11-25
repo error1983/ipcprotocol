@@ -1,11 +1,32 @@
+#if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
+#define _POSIX_C_SOURCE 200809L
+#endif
+
+#ifdef _WIN32
+#define ipc_strdup _strdup
+#else
+#define ipc_strdup strdup
+#endif
+
 /* C 回环测试：
  * gcc -std=c11 -O2 -I. loopback_test.c json.c message_stream.c rpc.c tcp.c -o out/loopback_test.exe -lws2_32 -lpthread
  */
+#ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <winsock2.h>
 #include <windows.h>
+#else
+#include <time.h>
+static void ipc_sleep_ms(int ms) {
+    struct timespec ts;
+    ts.tv_sec = ms / 1000;
+    ts.tv_nsec = (long)(ms % 1000) * 1000000L;
+    nanosleep(&ts, NULL);
+}
+#define Sleep(ms) ipc_sleep_ms((int)(ms))
+#endif
 
 #include <pthread.h>
 #include <stdio.h>
@@ -65,7 +86,7 @@ static JsonValue* h_fail(void* u, JsonValue** a, size_t n, char** err) {
     (void)u; (void)n;
     char buf[256];
     snprintf(buf, sizeof(buf), "boom: %s", a[0]->u.str);
-    *err = _strdup(buf);
+    *err = ipc_strdup(buf);
     return NULL;
 }
 static JsonValue* h_upload(void* u, JsonValue** a, size_t n, char** err) {
@@ -311,6 +332,7 @@ static void* conc_fn(void* a) {
 }
 
 int main(void) {
+    setvbuf(stdout, NULL, _IONBF, 0);   /* 便于崩溃时定位最后通过的用例 */
     /* 1. JSON 请求 + Unicode */
     {
         TestServer* s = start_server();
@@ -678,6 +700,43 @@ int main(void) {
         rpc_destroy(rpc);
         tcp_conn_free(conn);
         tcp_listener_free(ln);
+    }
+
+    /* 17. v1.1.3 自动握手：不显式 hello，首个业务请求也能过鉴权 */
+    {
+        OptsServer* s = start_opts(0, 0, "secret");
+        TcpConn* conn;
+        RpcProtocol* rpc = dial_opts(s, &conn, 0, 0, "secret");
+        JsonValue* p = json_arr();
+        json_arr_push(p, json_num(2));
+        json_arr_push(p, json_num(3));
+        RpcResult r = rpc_send_request(rpc, "add", p, NULL);
+        check("auto hello first request", r.value && r.value->type == JSON_NUM &&
+                                              r.value->u.number == 5);
+        rpc_result_free(&r);
+        check("auto hello auth_sent", rpc_auth_sent(rpc) == 1);
+        /* 第二次请求不应再握手（幂等） */
+        RpcResult r2 = rpc_send_request(rpc, "add", p, NULL);
+        check("auto hello second request", r2.value && r2.value->u.number == 5);
+        rpc_result_free(&r2);
+        json_free(p);
+        rpc_destroy(rpc);
+        tcp_conn_free(conn);
+    }
+    /* 18. 自动握手：错误 token -> EAUTH */
+    {
+        OptsServer* s = start_opts(0, 0, "secret");
+        TcpConn* conn;
+        RpcProtocol* rpc = dial_opts(s, &conn, 0, 0, "wrong");
+        JsonValue* p = json_arr();
+        json_arr_push(p, json_num(1));
+        json_arr_push(p, json_num(1));
+        RpcResult r = rpc_send_request(rpc, "add", p, NULL);
+        check("auto hello wrong token EAUTH", !r.value && r.code && strcmp(r.code, "EAUTH") == 0);
+        rpc_result_free(&r);
+        json_free(p);
+        rpc_destroy(rpc);
+        tcp_conn_free(conn);
     }
 
     printf("\n%d passed, %d failed\n", passed, failed);

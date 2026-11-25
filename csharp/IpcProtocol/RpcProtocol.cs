@@ -65,9 +65,22 @@ public sealed class RpcProtocol : IDisposable
     public string? AuthToken { get; }
     public string? RequiredToken { get; }
     private bool _authenticated;
+    private int _unauthorizedHits;
     private long _lastReceivedTicks = Environment.TickCount64;
     private readonly CancellationTokenSource? _heartbeatCts;
     private const int ProtocolVersion = 1;
+
+    // v1.1.2：能力协商（PROTOCOL.md §8.4）
+    public static readonly string[] DefaultCapabilities = { "ping", "binary", "event" };
+    public string[] Capabilities { get; }
+    public string ImplName { get; set; } = "csharp";
+    /// <summary>对端在 HELLO 中声明的能力；null 表示未声明（旧实现）。</summary>
+    public string[]? PeerCapabilities { get; private set; }
+    /// <summary>客户端收到 HELLO_ACK 时服务端声明的能力。</summary>
+    public string[]? ServerCapabilities { get; private set; }
+    /// <summary>因能力协商停用心跳的原因；null 表示心跳正常。</summary>
+    public string? HeartbeatDisabledReason { get; private set; }
+    private readonly SemaphoreSlim _authLock = new(1, 1);
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -99,13 +112,16 @@ public sealed class RpcProtocol : IDisposable
     }
 
     public RpcProtocol(MessageStream messageStream, TimeSpan? heartbeatInterval = null,
-        TimeSpan? heartbeatTimeout = null, string? authToken = null, string? requiredToken = null)
+        TimeSpan? heartbeatTimeout = null, string? authToken = null, string? requiredToken = null,
+        string[]? capabilities = null)
     {
         _messageStream = messageStream ?? throw new ArgumentNullException(nameof(messageStream));
         HeartbeatInterval = heartbeatInterval ?? TimeSpan.FromSeconds(5);
         HeartbeatTimeout = heartbeatTimeout ?? TimeSpan.FromSeconds(15);
-        AuthToken = authToken;
+        // v1.1.2：未显式传 token 时从环境变量继承（Node 主进程注入 IPC_TOKEN）
+        AuthToken = authToken ?? Environment.GetEnvironmentVariable("IPC_TOKEN");
         RequiredToken = requiredToken;
+        Capabilities = capabilities ?? DefaultCapabilities;
         _messageStream.Message += OnMessage;
         _messageStream.Error += OnStreamError;
         // 先挂好监听器再启动读循环，避免早到消息在注册前被分发的竞态
@@ -125,7 +141,7 @@ public sealed class RpcProtocol : IDisposable
         {
             try { await Task.Delay(HeartbeatInterval, ct).ConfigureAwait(false); }
             catch (OperationCanceledException) { return; }
-            if (_disposed) return;
+            if (_disposed || HeartbeatDisabledReason != null) return;
             long silent = Environment.TickCount64 - Interlocked.Read(ref _lastReceivedTicks);
             if (HeartbeatTimeout > TimeSpan.Zero && silent >= (long)HeartbeatTimeout.TotalMilliseconds)
             {
@@ -168,7 +184,11 @@ public sealed class RpcProtocol : IDisposable
         else
         {
             _authenticated = true;
-            ack = new { version = ProtocolVersion, ok = true };
+            PeerCapabilities = ReadCaps(content);
+            var peerCaps = PeerCapabilities;
+            if (peerCaps != null && !peerCaps.Contains("ping"))
+                DisableHeartbeat($"peer {ReadString(content, "impl") ?? "unknown"} declares no 'ping' capability");
+            ack = new { version = ProtocolVersion, ok = true, caps = Capabilities, impl = ImplName };
         }
         try { await SendRawAsync(Types.HelloAck, ContentTypes.Json, id, ack).ConfigureAwait(false); }
         catch { /* ignore */ }
@@ -189,6 +209,10 @@ public sealed class RpcProtocol : IDisposable
             if (json.TryGetProperty("version", out var v) && v.ValueKind == JsonValueKind.Number
                 && v.GetInt32() == ProtocolVersion)
             {
+                ServerCapabilities = ReadCaps(content);
+                if (ServerCapabilities != null && !ServerCapabilities.Contains("ping"))
+                    DisableHeartbeat($"server {ReadString(content, "impl") ?? "unknown"} declares no 'ping' capability");
+                _authenticated = true;
                 pending.TrySetResult(content);
                 return;
             }
@@ -207,8 +231,8 @@ public sealed class RpcProtocol : IDisposable
         var tcs = new TaskCompletionSource<object?>(TaskCreationOptions.RunContinuationsAsynchronously);
         _pendingRequests[id] = tcs;
         object payload = AuthToken is null
-            ? new { version = ProtocolVersion }
-            : new { version = ProtocolVersion, token = AuthToken };
+            ? new { version = ProtocolVersion, caps = Capabilities, impl = ImplName }
+            : new { version = ProtocolVersion, token = AuthToken, caps = Capabilities, impl = ImplName };
         try
         {
             await SendRawAsync(Types.Hello, ContentTypes.Json, id, payload).ConfigureAwait(false);
@@ -357,9 +381,11 @@ public sealed class RpcProtocol : IDisposable
 
     private async Task RejectUnauthorizedAsync(string id)
     {
+        // 未鉴权：回错误但不断链（允许随后 hello 重试）；连续 5 次才强制断开
+        int hits = Interlocked.Increment(ref _unauthorizedHits);
         try { await SendResponseAsync(id, new { error = "Unauthorized" }).ConfigureAwait(false); }
         catch { /* ignore */ }
-        Dispose();
+        if (hits >= 5) Dispose();
     }
 
     private async Task HandleRequestAsync(string id, object? request)
@@ -446,6 +472,30 @@ public sealed class RpcProtocol : IDisposable
         _ => true,
     };
 
+    // v1.1.2 能力协商辅助
+    private static string[]? ReadCaps(object? content)
+    {
+        if (content is not JsonElement json || json.ValueKind != JsonValueKind.Object) return null;
+        if (!json.TryGetProperty("caps", out var caps) || caps.ValueKind != JsonValueKind.Array) return null;
+        var list = new List<string>();
+        foreach (var item in caps.EnumerateArray())
+            if (item.ValueKind == JsonValueKind.String) list.Add(item.GetString()!);
+        return list.ToArray();
+    }
+
+    private static string? ReadString(object? content, string name)
+    {
+        if (content is not JsonElement json || json.ValueKind != JsonValueKind.Object) return null;
+        return json.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() : null;
+    }
+
+    private void DisableHeartbeat(string reason)
+    {
+        if (HeartbeatDisabledReason != null) return;
+        HeartbeatDisabledReason = reason;
+        try { _heartbeatCts?.Cancel(); } catch { /* ignore */ }
+    }
+
     private void OnStreamError(Exception error)
     {
         string? code = (error as StreamException)?.Code;  // 错误码透传（ERESYNC/ERESYNC_TIMEOUT 等）
@@ -482,10 +532,25 @@ public sealed class RpcProtocol : IDisposable
         }
     }
 
+    /// <summary>首次发业务请求前自动握手（取环境变量或构造参数里的 token），并发安全只握手一次。</summary>
+    public async Task EnsureAuthAsync()
+    {
+        if (string.IsNullOrEmpty(AuthToken) || _authenticated) return;
+        await _authLock.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            if (_authenticated) return;
+            await HelloAsync().ConfigureAwait(false);
+            _authenticated = true;
+        }
+        finally { _authLock.Release(); }
+    }
+
     /// <summary>发送 JSON 请求并等待响应。返回 string(TEXT)/byte[](BINARY)/JsonElement(JSON)。
     /// timeout 为 null 用 DefaultTimeout，TimeSpan.Zero 关闭超时。</summary>
     public async Task<object?> SendRequestAsync(string method, object? parameters = null, string? to = null, TimeSpan? timeout = null)
     {
+        await EnsureAuthAsync().ConfigureAwait(false);
         var id = Guid.NewGuid().ToString();
         var tcs = new TaskCompletionSource<object?>(TaskCreationOptions.RunContinuationsAsynchronously);
         _pendingRequests[id] = tcs;
@@ -518,6 +583,7 @@ public sealed class RpcProtocol : IDisposable
     /// <summary>发送二进制请求并等待响应；TimeSpan.Zero 关闭超时。</summary>
     public async Task<object?> SendRequestBinaryWithTimeoutAsync(TimeSpan timeout, string method, byte[] data, params object?[] args)
     {
+        await EnsureAuthAsync().ConfigureAwait(false);
         var id = Guid.NewGuid().ToString();
         var tcs = new TaskCompletionSource<object?>(TaskCreationOptions.RunContinuationsAsynchronously);
         _pendingRequests[id] = tcs;

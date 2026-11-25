@@ -4,6 +4,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <map>
@@ -70,7 +71,14 @@ public:
                 std::string authToken, std::string requiredToken)
         : state_(std::make_shared<State>()), ms_(std::move(ms)), authToken_(std::move(authToken)) {
         state_->requiredToken = std::move(requiredToken);
-        state_->authenticated.store(state_->requiredToken.empty());
+        // v1.1.2：未显式传 token 时回退环境变量 IPC_TOKEN（Node 主进程注入）
+        if (authToken_.empty()) {
+            if (const char* env = std::getenv("IPC_TOKEN")) {
+                if (*env) authToken_ = env;
+            }
+        }
+        // v1.1.3：区分服务端校验位与客户端握手完成，否则客户端会把自己当作已鉴权而跳过 HELLO
+        state_->authenticated.store(state_->requiredToken.empty() && authToken_.empty());
         state_->lastReceived.store(nowMs());
         auto state = state_;
         auto msCopy = ms_;
@@ -113,6 +121,7 @@ public:
     // timeoutMs：-1 用默认超时，0 关闭超时；超时抛 RpcException(code="ETIMEDOUT")，对齐 JS 修复版。
     Json sendRequest(const std::string& method, Json params = Json::null(), const std::string& to = "",
                      int64_t timeoutMs = -1) {
+        ensureAuth();
         std::string id = newUUID();
         auto pending = std::make_shared<Pending>();
         {
@@ -135,6 +144,7 @@ public:
     // 二进制请求：handler 实参为 [Bytes(data), ...args]；timeoutMs 语义同 sendRequest。
     Json sendRequestBinary(const std::string& method, const std::vector<uint8_t>& data,
                            const std::vector<Json>& args = {}, int64_t timeoutMs = -1) {
+        ensureAuth();
         std::string id = newUUID();
         auto pending = std::make_shared<Pending>();
         {
@@ -175,6 +185,21 @@ public:
 
     // ---- v1.1: HELLO 握手 ----
 
+    // ---- v1.1.3: 自动握手（P2） ----
+
+    // 首个业务请求前自动 HELLO：仅客户端（requiredToken 为空且持有 token）生效；锁内只握手一次。
+    void ensureAuth() {
+        if (!state_->requiredToken.empty() || authToken_.empty()) return;
+        if (state_->authenticated.load() || state_->authSent.load()) return;
+        std::lock_guard<std::mutex> lock(state_->authMu);
+        if (state_->authenticated.load() || state_->authSent.load()) return;
+        hello();
+        state_->authSent.store(true);
+    }
+
+    // 是否已完成（或被跳过）自动握手。
+    bool authSent() const { return state_->authSent.load() || state_->authenticated.load(); }
+
     // 发起 HELLO 握手；ACK error → EAUTH，版本不符 → EVERSION。timeoutMs 语义同 sendRequest。
     Json hello(int64_t timeoutMs = -1) {
         std::string id = newUUID();
@@ -184,6 +209,8 @@ public:
             state_->pending[id] = pending;
         }
         Json payload = Json::object().set("version", Json::ofNum(PROTOCOL_VERSION));
+        payload.set("caps", capsJson(state_->capabilities));
+        payload.set("impl", Json::ofStr(state_->implName));
         if (!authToken_.empty()) payload.set("token", Json::ofStr(authToken_));
         std::string body = payload.dump();
         if (!ms_->send(buildMessage(TYPE_HELLO, CONTENT_JSON, id,
@@ -192,6 +219,38 @@ public:
             throw RpcException("send failed");
         }
         return waitResult(id, pending, "hello", timeoutMs);
+    }
+
+    // ---- v1.1.2: 能力协商（PROTOCOL.md §8.4） ----
+    std::vector<std::string> capabilities() const { return state_->capabilities; }
+    std::string peerCapabilities() const { return state_->peerCapabilities; }
+    std::string serverCapabilities() const { return state_->serverCapabilities; }
+    std::string heartbeatDisabledReason() const { return state_->heartbeatReason; }
+
+    void setCapabilities(const std::vector<std::string>& caps, const std::string& implName = "") {
+        state_->capabilities = caps;
+        if (!implName.empty()) state_->implName = implName;
+    }
+
+    static Json capsJson(const std::vector<std::string>& caps) {
+        std::vector<Json> items;
+        for (const auto& c : caps) items.push_back(Json::ofStr(c));
+        return Json::ofArr(std::move(items));
+    }
+
+    static std::vector<std::string> readCaps(const Json& content) {
+        std::vector<std::string> out;
+        const Json* caps = content.find("caps");
+        if (!caps || caps->type != Json::Type::Arr) return out;
+        for (const auto& item : caps->arr) {
+            if (item.type == Json::Type::Str) out.push_back(item.str);
+        }
+        return out;
+    }
+
+    static bool hasPing(const std::vector<std::string>& caps) {
+        for (const auto& c : caps) if (c == "ping") return true;
+        return false;
     }
 
 private:
@@ -214,6 +273,17 @@ private:
         std::atomic<bool> authenticated{true};
         std::atomic<int64_t> lastReceived{0};
         std::string requiredToken;
+        // ---- v1.1.2: 能力协商（PROTOCOL.md §8.4） ----
+        std::vector<std::string> capabilities{"ping", "binary", "event"};
+        std::string implName{"cpp"};
+        std::string peerCapabilities;   // 逗号分隔；空 = 旧实现（未声明）
+        std::string serverCapabilities; // 客户端侧记录 HELLO_ACK 的 caps
+        std::atomic<bool> heartbeatDisabled{false};
+        std::string heartbeatReason;
+        std::atomic<int> unauthorizedHits{0};
+        // ---- v1.1.3: 首个业务请求前自动握手（P2） ----
+        std::atomic<bool> authSent{false};
+        std::mutex authMu;
     };
 
     std::shared_ptr<State> state_;
@@ -271,6 +341,7 @@ private:
         for (;;) {
             std::this_thread::sleep_for(std::chrono::milliseconds(intervalMs));
             if (state->closed.load()) return;
+            if (state->heartbeatDisabled.load()) return;   // v1.1.2：能力协商停用心跳
             int64_t silent = nowMs() - state->lastReceived.load();
             if (timeoutMs > 0 && silent >= timeoutMs) {
                 std::string msg = "heartbeat timeout: no data for " + std::to_string(silent) + "ms";
@@ -321,10 +392,13 @@ private:
         }
 
         if (msgType == TYPE_REQUEST) {
-            if (!state->authenticated.load()) {
+            if (!state->requiredToken.empty() && !state->authenticated.load()) {
                 sendErrorResponse(ms, id, "Unauthorized");
-                bool expected = false;
-                if (state->closed.compare_exchange_strong(expected, true)) ms->close();
+                // v1.1.2：回错误但不断链（允许随后 HELLO 重试）；连续 5 次才断开
+                if (state->unauthorizedHits.fetch_add(1) >= 4) {
+                    bool expected = false;
+                    if (state->closed.compare_exchange_strong(expected, true)) ms->close();
+                }
                 return;
             }
             std::vector<uint8_t> raw(payload, payload + payloadLen);
@@ -350,7 +424,7 @@ private:
                 }
             }
         } else if (msgType == TYPE_EVENT) {
-            if (!state->authenticated.load()) return; // 未鉴权事件直接丢弃
+            if (!state->requiredToken.empty() && !state->authenticated.load()) return; // 未鉴权事件直接丢弃
             std::lock_guard<std::mutex> lock(state->mu);
             if (state->onEvent) state->onEvent(contentType, std::move(content));
         } else if (msgType == TYPE_PING) {
@@ -370,7 +444,7 @@ private:
                     state->pending.erase(it);
                 }
             }
-            if (p) deliverHelloAck(p, content);
+            if (p) deliverHelloAck(p, content, state);
         }
     }
 
@@ -394,7 +468,20 @@ private:
                 }
             } else {
                 state->authenticated.store(true);
+                // v1.1.2：能力协商
+                auto peer = readCaps(content);
+                std::string peerJoined;
+                for (const auto& c : peer) peerJoined += (peerJoined.empty() ? "" : ",") + c;
+                state->peerCapabilities = peerJoined;
+                if (!peer.empty() && !hasPing(peer)) {
+                    const Json* impl = content.find("impl");
+                    std::string implName = (impl && impl->type == Json::Type::Str) ? impl->str : "unknown";
+                    state->heartbeatDisabled.store(true);
+                    state->heartbeatReason = "peer " + implName + " declares no 'ping' capability";
+                }
                 ack.set("ok", Json::ofBool(true));
+                ack.set("caps", capsJson(state->capabilities));
+                ack.set("impl", Json::ofStr(state->implName));
                 ok = true;
             }
         } else {
@@ -404,13 +491,18 @@ private:
         ms->send(buildMessage(TYPE_HELLO_ACK, CONTENT_JSON, id,
                               reinterpret_cast<const uint8_t*>(body.data()), body.size()));
         if (!ok) {
-            bool expected = false;
-            if (state->closed.compare_exchange_strong(expected, true)) ms->close();
+            // v1.1.2：先让 ack 刷到对端再断链
+            std::thread([state, ms]() {
+                std::this_thread::sleep_for(std::chrono::milliseconds(300));
+                bool expected = false;
+                if (state->closed.compare_exchange_strong(expected, true)) ms->close();
+            }).detach();
         }
     }
 
     // 客户端 HELLO_ACK 解析：error → EAUTH，版本不符 → EVERSION。
-    static void deliverHelloAck(const std::shared_ptr<Pending>& p, const Json& content) {
+    static void deliverHelloAck(const std::shared_ptr<Pending>& p, const Json& content,
+                                const std::shared_ptr<State>& state) {
         if (content.type != Json::Type::Obj) {
             deliver(p, Json::null(), std::make_unique<RpcException>("Invalid hello ack payload", "EAUTH"));
             return;
@@ -425,6 +517,15 @@ private:
         if (!v || v->type != Json::Type::Num || v->number != PROTOCOL_VERSION) {
             deliver(p, Json::null(), std::make_unique<RpcException>("Unsupported protocol version", "EVERSION"));
             return;
+        }
+        // v1.1.2：记录服务端能力；服务端不支持 PING 则本端停用心跳
+        auto caps = readCaps(content);
+        std::string joined;
+        for (const auto& c : caps) joined += (joined.empty() ? "" : ",") + c;
+        state->serverCapabilities = joined;
+        if (!caps.empty() && !hasPing(caps)) {
+            state->heartbeatDisabled.store(true);
+            state->heartbeatReason = "server declares no 'ping' capability";
         }
         deliver(p, content, nullptr);
     }

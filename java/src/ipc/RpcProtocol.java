@@ -82,10 +82,22 @@ public class RpcProtocol implements Closeable {
     private final long heartbeatIntervalMs;
     private final long heartbeatTimeoutMs;
     private final String authToken;
+    /** v1.1.3：首个业务请求前自动握手的并发闸门。 */
+    private volatile boolean authSent = false;
+    private volatile CompletableFuture<Void> authFuture = null;
     private final String requiredToken;
     private volatile long lastReceivedMs;
     private volatile boolean authenticated;
+    private int unauthorizedHits = 0;
     private ScheduledFuture<?> heartbeatTask;
+
+    // ---- v1.1.2: 能力协商（PROTOCOL.md §8.4） ----
+    public static final List<String> DEFAULT_CAPABILITIES = List.of("ping", "binary", "event");
+    private final List<String> capabilities;
+    private volatile String implName = "java";
+    private volatile List<String> peerCapabilities = null;
+    private volatile List<String> serverCapabilities = null;
+    private volatile String heartbeatDisabledReason = null;
 
     public RpcProtocol(MessageStream messageStream) {
         this(messageStream, 5000, 15000, null, null);
@@ -94,18 +106,29 @@ public class RpcProtocol implements Closeable {
     /**
      * @param heartbeatIntervalMs 心跳发送间隔（毫秒），<=0 关闭心跳
      * @param heartbeatTimeoutMs  静默超时（毫秒），超时以 EHEARTBEAT 断链；<=0 关闭
-     * @param authToken           客户端 HELLO 携带的鉴权令牌（可选）
+     * @param authToken           客户端 HELLO 携带的鉴权令牌（可选；为空时回退环境变量 IPC_TOKEN）
      * @param requiredToken       服务端要求的令牌；非 null 时未通过 HELLO 鉴权的请求被拒绝
      */
     public RpcProtocol(MessageStream messageStream, long heartbeatIntervalMs, long heartbeatTimeoutMs,
                        String authToken, String requiredToken) {
+        this(messageStream, heartbeatIntervalMs, heartbeatTimeoutMs, authToken, requiredToken,
+                DEFAULT_CAPABILITIES);
+    }
+
+    public RpcProtocol(MessageStream messageStream, long heartbeatIntervalMs, long heartbeatTimeoutMs,
+                       String authToken, String requiredToken, List<String> capabilities) {
         if (messageStream == null) throw new IllegalArgumentException("messageStream is undefined");
         this.messageStream = messageStream;
         this.heartbeatIntervalMs = heartbeatIntervalMs;
         this.heartbeatTimeoutMs = heartbeatTimeoutMs;
-        this.authToken = authToken;
+        String envToken = System.getenv("IPC_TOKEN");
+        this.authToken = (authToken != null && !authToken.isEmpty()) ? authToken
+                : (envToken != null && !envToken.isEmpty() ? envToken : null);
         this.requiredToken = requiredToken;
-        this.authenticated = requiredToken == null;
+        this.capabilities = (capabilities == null || capabilities.isEmpty())
+                ? DEFAULT_CAPABILITIES : List.copyOf(capabilities);
+        // v1.1.3：区分服务端校验位与客户端握手完成，否则客户端会把自己当作已鉴权而跳过 HELLO
+        this.authenticated = (requiredToken == null && this.authToken == null);
         this.lastReceivedMs = System.currentTimeMillis();
         messageStream.addMessageListener(this::handleMessage);
         messageStream.addErrorListener(err -> {
@@ -120,9 +143,35 @@ public class RpcProtocol implements Closeable {
         }
     }
 
+    public List<String> getCapabilities() { return capabilities; }
+    public String getImplName() { return implName; }
+    public void setImplName(String name) { implName = name; }
+    public List<String> getPeerCapabilities() { return peerCapabilities; }
+    public List<String> getServerCapabilities() { return serverCapabilities; }
+    public String getHeartbeatDisabledReason() { return heartbeatDisabledReason; }
+    public boolean isAuthenticated() { return authenticated; }
+
+    /** 对端声明了能力但不含 ping：停发心跳并停用静默超时，避免误杀。 */
+    private void disableHeartbeat(String reason) {
+        if (heartbeatDisabledReason != null) return;
+        heartbeatDisabledReason = reason;
+        ScheduledFuture<?> task = heartbeatTask;
+        if (task != null) task.cancel(false);
+        heartbeatTask = null;
+    }
+
+    private List<String> readCapabilities(Object content) {
+        if (!(content instanceof Map)) return null;
+        Object caps = ((Map<?, ?>) content).get("caps");
+        if (!(caps instanceof List)) return null;
+        List<String> out = new ArrayList<>();
+        for (Object item : (List<?>) caps) if (item instanceof String) out.add((String) item);
+        return out;
+    }
+
     /** 心跳节拍：静默超过 timeout 则以 EHEARTBEAT 结算全部 pending 并断链；否则按间隔发 PING。 */
     private void heartbeatTick() {
-        if (closed) return;
+        if (closed || heartbeatDisabledReason != null) return;
         long silent = System.currentTimeMillis() - lastReceivedMs;
         if (heartbeatTimeoutMs > 0 && silent >= heartbeatTimeoutMs) {
             RpcException err = new RpcException("heartbeat timeout: no data for " + silent + "ms", "EHEARTBEAT");
@@ -276,12 +325,12 @@ public class RpcProtocol implements Closeable {
             lastReceivedMs = System.currentTimeMillis();   // 任何入站消息都刷新心跳基准
 
             if (msg.type == TYPE_REQUEST) {
-                if (!authenticated) { rejectUnauthorized(msg.id); return; }
+                if (requiredToken != null && !authenticated) { rejectUnauthorized(msg.id); return; }
                 executor.submit(() -> handleRequest(msg.id, msg.content));
             } else if (msg.type == TYPE_RESPONSE) {
                 handleResponse(msg.id, msg.content);
             } else if (msg.type == TYPE_EVENT) {
-                if (!authenticated) return;   // 未鉴权事件直接丢弃
+                if (requiredToken != null && !authenticated) return;   // 未鉴权事件直接丢弃
                 emitEvent(msg.contentType, msg.content);
             } else if (msg.type == TYPE_PING) {
                 sendPong(msg.id);
@@ -397,7 +446,8 @@ public class RpcProtocol implements Closeable {
         Map<String, Object> error = new LinkedHashMap<>();
         error.put("error", "Unauthorized");
         sendResponse(id, error, CONTENT_JSON);
-        close();
+        // v1.1.2：回错误但不断链（允许随后 HELLO 重试）；连续 5 次才断开
+        if (++unauthorizedHits >= 5) close();
     }
 
     @SuppressWarnings("unchecked")
@@ -414,7 +464,13 @@ public class RpcProtocol implements Closeable {
                 ack.put("error", "Unauthorized");
             } else {
                 authenticated = true;
+                peerCapabilities = readCapabilities(map);
+                if (peerCapabilities != null && !peerCapabilities.contains("ping")) {
+                    disableHeartbeat("peer " + implName + " declares no 'ping' capability");
+                }
                 ack.put("ok", true);
+                ack.put("caps", capabilities);
+                ack.put("impl", implName);
                 ok = true;
             }
         } else {
@@ -443,8 +499,32 @@ public class RpcProtocol implements Closeable {
             pending.completeExceptionally(new RpcException("Unsupported protocol version", "EVERSION"));
             return;
         }
+        serverCapabilities = readCapabilities(map);
+        if (serverCapabilities != null && !serverCapabilities.contains("ping")) {
+            disableHeartbeat("server declares no 'ping' capability");
+        }
+        authenticated = true;
         pending.complete(content);
     }
+
+    /**
+     * 首个业务请求前自动握手（v1.1.3，P2）。
+     * 仅客户端（requiredToken == null 且持有 authToken）生效；并发调用共享同一个握手 Future。
+     */
+    private synchronized CompletableFuture<Void> ensureAuth() {
+        if (requiredToken != null || authToken == null) return CompletableFuture.completedFuture(null);
+        if (authenticated || authSent) return CompletableFuture.completedFuture(null);
+        if (authFuture != null) return authFuture;
+        CompletableFuture<Void> f = hello(defaultTimeoutMs).thenApply(ignored -> {
+            authSent = true;
+            return null;
+        });
+        authFuture = f.whenComplete((v, err) -> { if (err != null) authFuture = null; });
+        return authFuture;
+    }
+
+    /** 是否已完成（或被跳过）自动握手。 */
+    public boolean isAuthSent() { return authSent || authenticated; }
 
     /** 发起 HELLO 握手（默认超时）；ACK error → EAUTH，版本不符 → EVERSION。 */
     public CompletableFuture<Object> hello() {
@@ -458,6 +538,8 @@ public class RpcProtocol implements Closeable {
         armTimeout(id, future, "hello", timeoutMs);
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("version", PROTOCOL_VERSION);
+        payload.put("caps", capabilities);
+        payload.put("impl", implName);
         if (authToken != null) payload.put("token", authToken);
         try {
             sendRaw(TYPE_HELLO, CONTENT_JSON, id, payload);
@@ -486,6 +568,10 @@ public class RpcProtocol implements Closeable {
 
     /** 带显式超时（毫秒）的请求；0 关闭超时。超时以 RpcException(code="ETIMEDOUT") 完成，对齐 JS 修复版。 */
     public CompletableFuture<Object> sendRequest(String method, Object params, String to, long timeoutMs) {
+        return ensureAuth().thenCompose(ignored -> doSendRequest(method, params, to, timeoutMs));
+    }
+
+    private CompletableFuture<Object> doSendRequest(String method, Object params, String to, long timeoutMs) {
         String id = UUID.randomUUID().toString();
         CompletableFuture<Object> future = new CompletableFuture<>();
         pendingRequests.put(id, future);
@@ -510,6 +596,10 @@ public class RpcProtocol implements Closeable {
 
     /** 带显式超时（毫秒）的二进制请求；0 关闭超时。 */
     public CompletableFuture<Object> sendRequestBinaryWithTimeout(long timeoutMs, String method, byte[] data, Object... args) {
+        return ensureAuth().thenCompose(ignored -> doSendRequestBinary(timeoutMs, method, data, args));
+    }
+
+    private CompletableFuture<Object> doSendRequestBinary(long timeoutMs, String method, byte[] data, Object... args) {
         String id = UUID.randomUUID().toString();
         CompletableFuture<Object> future = new CompletableFuture<>();
         pendingRequests.put(id, future);

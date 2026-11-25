@@ -409,3 +409,42 @@ fn resync_timeout() {
     cli.close();
     std::mem::forget(conn);
 }
+// ---- v1.1.3 自动握手（P2） ----
+
+#[test]
+fn auto_hello_first_request() {
+    let (cli, server) = pair(Duration::ZERO, Duration::ZERO, Some("secret"), Some("secret"));
+    // 不显式 hello，直接业务请求
+    let v = cli.send_request("add", Json::Arr(vec![Json::Num(2.0), Json::Num(3.0)])).unwrap();
+    assert_eq!(v.as_f64(), Some(5.0));
+    assert!(cli.auth_sent());
+    cli.close();
+    server.close();
+}
+
+#[test]
+fn auto_hello_concurrent() {
+    let (cli, server) = pair(Duration::ZERO, Duration::ZERO, Some("secret"), Some("secret"));
+    let mut handles = Vec::new();
+    for i in 0..8u32 {
+        let c = cli.clone();
+        handles.push(std::thread::spawn(move || {
+            c.send_request("add", Json::Arr(vec![Json::Num(i as f64), Json::Num(1.0)]))
+        }));
+    }
+    for (i, h) in handles.into_iter().enumerate() {
+        let v = h.join().unwrap().unwrap();
+        assert_eq!(v.as_f64(), Some(i as f64 + 1.0));
+    }
+    cli.close();
+    server.close();
+}
+
+#[test]
+fn auto_hello_wrong_token() {
+    let (cli, server) = pair(Duration::ZERO, Duration::ZERO, Some("wrong"), Some("secret"));
+    let err = cli.send_request("add", Json::Arr(vec![Json::Num(1.0), Json::Num(1.0)])).unwrap_err();
+    assert_eq!(err.code(), "EAUTH");
+    cli.close();
+    server.close();
+}

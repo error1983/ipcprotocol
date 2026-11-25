@@ -3,7 +3,7 @@
 本文档定义 `MessageStream.js` / `RpcProtocol.js` 所用协议的**线格式（wire format）与行为语义**，
 作为 Node.js / Python / C# / Java / Go / Rust / C++ / C 各实现的唯一互操作依据。
 
-- 规格版本：1.1（v1.0 线格式不变；v1.1 新增消息类型 3–6、心跳、可选 HELLO 握手、重同步超时断链，见 §4.5、§8.1、§8.2）
+- 规格版本：1.1.1（v1.0 线格式不变；v1.1 新增消息类型 3–6、心跳、可选 HELLO 握手、重同步超时断链，见 §4.5、§8.1、§8.2；v1.1.1 为行为加固，线格式零改动，见 §8.3）
 - 字节序约定：除特别注明外，长度字段为**小端（LE）**；二进制请求体内的长度字段为**大端（BE）**
 - 文本编码：一律 UTF-8
 - 传输层：协议与传输无关，可运行于任意双向字节流（TCP、命名管道、WebSocket 二进制帧等）。
@@ -669,3 +669,230 @@ c/out/example.exe client <port>            # C 客户端（11 项）
    不属于协议帧；其他语言实现直接关闭流即可，互操作不受影响。
 5. 请求体中的 `to` 字段原版仅透传，服务端不做路由处理；移植版保持一致。
 6. CRC 开关、maxBufferSize 属于**连接两端必须协商一致**的配置，协议内无协商机制。
+### 8.3 v1.1.1 增补（生产加固，向后兼容）
+
+以下三条是 v1.1 实测中暴露问题的修补，**线格式零改动**，仅行为语义补充：
+
+**1）有在途请求时不做心跳断链**
+
+`heartbeatSkipWhilePending` 默认 `true`。检查周期内若 `pendingRequests.size > 0`，即使静默时长
+已超过 `heartbeatTimeoutMs` 也**不**判定假死、不断链 —— 因为对端可能正在执行长任务
+（Python GIL 独占、C# 同步计算、GC 暂停），此时不回 PONG 属正常。
+
+- 仍未收到响应时，由**请求级超时**（默认 15000ms，可显式指定）结算该请求，业务方拿到 `ETIMEDOUT`；
+- 在途请求清零后，心跳恢复生效，若对端确实已死则在下一个周期内以 `EHEARTBEAT` 断链；
+- 需要更激进的天花板检测时可设 `heartbeatSkipWhilePending = false`（回到 v1.1 行为）。
+- 长任务调用方应使用显式超时：`invoke(method, params, { timeout })`，不要依赖默认 15s。
+
+**2）连接销毁必须结算在途请求**
+
+`MessageStream.destroy()` / `_failClosed()` 必须向 RPC 层广播一次 `close` 事件；`RpcProtocol`
+收到后按 `ECLOSED` 结算全部 pending 并清除心跳定时器。缺此约定会出现"1000 个请求永久悬空、
+进程无法退出"的挂死现象。
+
+**3）事件投递不产生日志噪音**
+
+`type=2(EVENT)` 的投递走普通 `emit('event')`；无监听者时静默丢弃，不得逐条打印错误日志
+（否则高频事件会把日志刷爆）。`type=0/1` 的运行期错误仍走 `_safeEmit('error')`。
+
+**4）超时参数（API 层）**
+
+- `RpcProtocol.sendRequestBinary(method, buffer, args?, timeoutMs?)`：第三参若为数字，按旧语义视为
+  `timeoutMs`；
+- `NativeService.sendRequest(method, params, to?, timeoutMs?)` 透传；
+- 新增 `NativeService.invoke(method, params, { timeout, binary })` 作为长任务/二进制的统一入口。
+
+### 8.4 v1.1.2 增补：能力协商 + 默认鉴权 + 进程守护
+
+线格式仍然零改动：能力声明复用 HELLO / HELLO_ACK 的 JSON 体字段。
+
+**1）能力协商（HELLO / HELLO_ACK 新增字段）**
+
+```jsonc
+// HELLO（client -> server）
+{ "version": 1, "token": "<可选>", "caps": ["ping","binary","event"], "impl": "node|python|csharp" }
+// HELLO_ACK（server -> client）
+{ "version": 1, "ok": true, "caps": ["ping","binary","event"], "impl": "node" }
+```
+
+- `caps` 缺省/缺失 = 旧实现，**不做任何推断，行为完全同 v1.1.1**（向后兼容）；
+- 若对端声明了 `caps` 且**不含 `"ping"`**：本端立即停发心跳、停用静默超时判定，
+  并在 `heartbeatDisabled` 事件里给出原因。避免"对端本来就没心跳能力，却被本端 15s 判死"的误杀；
+- `heartbeatRequireCapability = true`（严格模式）：只有对端显式声明 `"ping"` 才发心跳；
+  内网已知全为新实现时推荐开启，混合老实现时保持默认 `false`；
+- 对端能力可读：JS `rpc.peerCapabilities / rpc.serverCapabilities`，Python `rpc.peer_capabilities / rpc.server_capabilities`，C# `PeerCapabilities / ServerCapabilities`。
+
+**2）默认鉴权（生产默认开启）**
+
+- `NativeService` 默认 `requireAuth = true`：构造时用 `crypto.randomUUID()` 生成每实例独立 token；
+- 服务端以 `requiredToken` 强校验：**未经 HELLO 的 REQUEST 一律回 `{error:"Unauthorized"}`**（对端表现为 `EREMOTE`），handler 不会执行；连续 5 次仍未鉴权才断链（允许"先发请求、后补握手"的客户端自愈）；
+- 子进程通过环境变量接收：`IPC_TOKEN`（token 本体）、`IPC_REQUIRE_AUTH=1`；
+  Python / C# 构造时**自动读取 `IPC_TOKEN`**，并在首个业务请求前自动 `hello()`（并发安全，只握手一次）；
+- 握手失败语义：token 不符 → `HELLO_ACK{error:"unauthorized"}` → 客户端 `EAUTH`；
+  版本不符 → `HELLO_ACK{error:"unsupported protocol version: N"}` → 客户端 `EVERSION`；
+  服务端在 ack 落盘后延迟 300ms 断链（立即 destroy 会丢掉未刷出的 ack，对端只见 `ECLOSED`）；
+- 逃生开关：`requireAuth: false`（完全不鉴权）或显式传入固定 `authToken`（自管 token 分发）。
+  升级注意：默认鉴权开启后，未实现 HELLO 的旧子进程会全部被拒，必须同步升级或临时关闭。
+
+**3）进程守护（NativeService，v1.1.2 起默认开启）**
+
+- `autoRestart = true`、`restartDelayMs = 500`、指数退避上限 `maxRestartDelayMs = 30000`、`maxRestarts = Infinity`；
+- 子进程 `close` → 置 `process=null`、`isConnected=false`、销毁 rpc 会话，然后按退避重启；
+- **管道名保持不变**，子进程重启后自动重连同名管道；`call` 代理会在下一次 `waitForConnection()` 里挂起等待；
+- 事件：`crash {code,signal,crashes}`、`restarting {attempt,delay,exitCode}`、`restarted {attempt}`、`give-up {attempts,exitCode}`；
+- 计数清零策略：连接**稳定运行** `restartResetAfterMs`（默认 30s）后才清零，避免"启动即崩"循环里退避被反复重置；
+- `stop()` 为显式停止：置 `_intentionalStop`、清重启/稳定计时器，**不触发** crash 与重启；
+- 超限放弃时只 `emit('give-up')`，不再重启；需要人工介入或外层编排拉起。
+
+**4）实现进度**
+
+| 能力 | Node | Python | C# | Java/Go/Rust/C++/C |
+| --- | --- | --- | --- | --- |
+| caps 声明与记录 | ✅ | ✅ | ✅ | 未实现（缺失即视为旧实现，兼容） |
+| 无 ping 对端停用心跳 | ✅ | ✅ | ✅ | — |
+| 默认 token + 自动 hello | ✅（NativeService） | ✅ | ✅ | — |
+| 进程守护/退避/事件 | ✅（NativeService） | —（由宿主托管） | — | — |
+
+### 8.5 v1.1.3 增补：五语言能力协商 / 多客户端会话 / token 热轮换
+
+线格式仍**零改动**：能力声明继续复用 HELLO / HELLO_ACK 的 JSON 体，多客户端与轮换全部发生在连接层与会话管理层。
+
+**1）五语言能力协商（Java / Go / Rust / C++ / C）**
+
+五个实现补齐了和 Node/Python/C# 相同的一套语义：
+
+| 项 | Java | Go | Rust | C++ | C |
+| --- | --- | --- | --- | --- | --- |
+| 默认能力声明 | `DEFAULT_CAPABILITIES` | `DefaultCapabilities` | `DEFAULT_CAPABILITIES` | `State::capabilities` | `rpc_set_capabilities()` |
+| 实现名 | `implName` | `ImplName` | `impl_name` | `State::implName` | `impl_name` |
+| 对端/服务端能力 | `getPeerCapabilities()` / `getServerCapabilities()` | `PeerCapabilities()` / `ServerCapabilities()` | `peer` / `server` | `State::peerCapabilities` / `serverCapabilities` | `rpc_peer_capabilities()` / `rpc_server_capabilities()` |
+| 对端无 ping → 停心跳 | `disableHeartbeat()` | `disableHeartbeat()`（`sync.Once` 防重复 close） | `disable_heartbeat()` | `State::heartbeatDisabled` | `hb_disabled` + `hb_reason` |
+| 停用原因可读 | `heartbeatDisabledReason` | `HeartbeatDisabledReason()` | `heartbeat_reason` | `heartbeatReason` | `rpc_heartbeat_disabled_reason()` |
+| HELLO/ACK 带 `caps`+`impl` | ✅ | ✅ | ✅ | ✅ | ✅（`caps_to_json()`） |
+| token 从 `IPC_TOKEN` 兜底 | ✅ | ✅ | ✅ | ✅（`getenv`） | ✅（`getenv`） |
+| 未鉴权请求容错 | 5 次计数后 close | 5 次计数后 close | 5 次计数后 close | 5 次计数后 close | 5 次计数后 close |
+| 握手失败断链 | ack 落地后 300ms | 300ms（goroutine） | 300ms（detach 线程） | 300ms（detach 线程） | **立即 close**（见下） |
+
+**C 实现的例外（重要）**：C 版不做"延迟 300ms 断链"，握手失败直接 `rpc_close()`。
+原因是 detached 线程在调用方 `rpc_destroy()` 之后仍持有 `RpcProtocol*`，触发 use-after-free
+（实测在 `version mismatch EVERSION` 用例后 0xC0000005 崩溃）。`ms_send` 是同步写，ack 已进内核缓冲，
+立即关闭不会丢 ack。其余语言对象有引用计数/所有权保证，可安全延迟关闭。
+
+**2）多客户端会话（NativeService）**
+
+- 构造参数：`maxClients`（默认 8）、`clients: Map<clientId, {id,socket,rpc,connectedAt,pid}>`、`_primaryId`；
+- 连入即分配 `c1/c2/...`，**首个连入者为主会话**（`primary: true`），触发 `clientConnected {id,socket}`；
+- 默认路由：`svc.call.xxx()` / `svc.invoke()` / `svc.callBinary()` 一律走主会话；
+- 精确路由：`svc.callTo(clientId).xxx()`、`svc.sendRequestTo(clientId, ...)`；
+- 广播：`svc.broadcastText(text)` 向全部在线会话推 EVENT（返回成功发送数）；
+- 断开：`_removeClient()` 只清该会话；**主会话断开自动切换到下一个**并 emit `primaryChanged`；
+  仅当全部会话清空才 emit `disconnect`；
+- 只读状态：`svc.clientCount`、`svc.getClients()`、`svc.getPrimaryClientId()`、
+  `svc.getProcessStatus()` 中的 `clients / primaryClient / acceptedTokens`；
+- 超限：达到 `maxClients` 后新连接直接 destroy（不挤掉已有会话，避免误伤主会话）。
+
+**3）token 热轮换**
+
+```js
+const newToken = svc.rotateToken({ graceMs: 300000 });  // 默认宽限 5 分钟
+svc.revokeToken(oldToken);                              // 立即吊销（可提前）
+```
+
+- 实现为 `requiredTokens: Set<string>`：`RpcProtocol` 判定 `requiredTokens.has(token)`，
+  `setRequiredTokens(tokens)` 可对**在线会话**热更新（不等重连）；
+- `rotateToken()` 生成新 token 并**立即生效**，旧 token 保留 `graceMs` 后自动 `revokeToken()`；
+- 宽限期内新旧 token 都能完成握手；已握手会话的鉴权位是粘性的，**轮换不影响在跑会话**；
+- 事件：`tokenRotated {graceMs}`、`tokenRevoked {}`；`tokenGraceMs` 构造参数为默认宽限值；
+- `requiredTokens.size === 0`（即 `requireAuth:false`）时，会话初始即为已鉴权。
+
+**4）实现进度（P1 收口）**
+
+| 能力 | Node | Python | C# | Java | Go | Rust | C++ | C |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| caps 声明与记录 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| 无 ping 对端停用心跳 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| 默认 token（env 兜底） | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| 自动 hello（首请求前） | ✅ | ✅ | ✅ | ⏳ | ⏳ | ⏳ | ⏳ | ⏳ |
+| 多客户端会话 | ✅ | —（宿主职责） | — | — | — | — | — | — |
+| token 热轮换 | ✅ | — | — | — | — | — | — | — |
+| 进程守护/退避 | ✅ | — | — | — | — | — | — | — |
+
+> ⏳ 自动 hello：五语言目前需调用方在首个业务请求前显式 `hello()`（Node 侧由 NativeService/子进程模板负责）。
+> 该行为不影响已实现的鉴权判定与握手流程，属体验优化，可在外层启动脚本里统一封装。
+
+**5）本轮回归结果（Windows 本机，2026-11-26）**
+
+| 套件 | 结果 |
+| --- | --- |
+| `tests/v112/test_auth_caps.js` | 12 / 12 |
+| `tests/v112/test_restart.js` | 22 / 22 |
+| `tests/v112/test_multiclient_rotation.js` | 21 / 21 |
+| Python 鉴权（good/bad） | 3 + 1 |
+| C# 鉴权（good/bad） | 3 + 1 |
+| `test_v11.js` | 13 / 13 |
+| Java LoopbackTest | 28 / 28 |
+| Go `go test` | ok（2.37s） |
+| Rust `cargo test` | 15 / 15 |
+| C++ loopback | 32 / 32 |
+| C loopback | 30 / 30 |
+| 一键脚本 `tests/v112/run_all.ps1` | 全绿 |
+
+P0-3 / P0-5 / P0-6 与 P1（多语言 caps、多客户端、token 轮换）至此关闭；剩余为 P2（自动 hello 封装、宿主侧守护编排、跨平台验证）。
+
+### 8.6 v1.1.4 增补：自动握手 / 宿主侧守护 / 跨平台
+
+本节对应 P2 收口，线格式仍零改动。
+
+**1）五语言自动 hello（首个业务请求前自动握手）**
+
+| 语言 | 入口 | 开关/幂等 | 状态查询 |
+| --- | --- | --- | --- |
+| Java | `sendRequest` / `sendRequestBinary*` 内部 `ensureAuth()` | `synchronized` + `CompletableFuture` 共享 | `isAuthSent()` |
+| Go | `SendRequestToTimeout` / `SendRequestBinaryTimeout` 内部 `ensureAuth()` | `authMu` 串行 + `authSent atomic.Bool` | `AuthSent()` |
+| Rust | `send_request_to_timeout` / `send_request_binary_timeout` | `auth_lock: Mutex<()>` | `auth_sent()` |
+| C++ | `sendRequest` / `sendRequestBinary` | `State::authMu` + `authSent` | `authSent()` |
+| C | `rpc_send_request*` 内部 `rpc_ensure_auth()` | `auth_mu` 互斥 | `rpc_auth_sent()` |
+
+共同约束：
+
+- **只在客户端角色生效**（`required_token` 为空且 `auth_token` 非空）；服务端不自动握手，避免自己打自己；
+- 并发首请求只握手一次（锁 + 完成标记），握手失败原样抛 `EAUTH`/`EVERSION`，不会带着未鉴权请求去撞 5 次断链阈值；
+- **鉴权语义拆成两个概念**：`authenticated` = "对端已通过我的校验"（仅服务端角色用它拒绝请求），`authSent` = "我已握手完成"。
+  之前五个实现都把两者混成一个布尔，客户端一构造就把自己标成已鉴权，导致 `ensureAuth()` 短路、业务请求直接吃 `Unauthorized`。
+  这是本轮实测暴露的真实缺陷（Java/Go/Rust/C++/C 全部命中），修复后才有自动握手的可能。
+
+**2）宿主侧守护（非 Node 宿主）**
+
+Node 侧守护在 `nativeService.js`；Python / C# / Java 作为宿主拉起子进程时，使用同语义的独立守护类：
+
+| 语言 | 文件 | 主要 API |
+| --- | --- | --- |
+| Python | `python/supervisor.py` | `Supervisor(cmd, env=…, cwd=…)`、`start()/stop()/is_running()/status()`、回调 `on_crash/on_restarting/on_restarted/on_give_up` |
+| C# | `csharp/IpcProtocol/Supervisor.cs` | `Start()/StopAsync()`、`IsRunning/Pid/CrashCount`、`OnCrash/OnRestarting/OnRestarted/OnGiveUp` |
+| Java | `java/src/ipc/Supervisor.java` | `start()/stop()/isRunning()/pid()`、`onCrash/onRestarting/onRestarted/onGiveUp` |
+
+三份实现对齐同一套策略：初始延迟 500ms、指数翻倍、上限 30s、`maxRestarts` 后可放弃、稳定运行 `resetAfterMs`（默认 30s）才清零计数、`stop()` 属显式停止（不触发崩溃事件、不再重启）。
+
+**3）跨平台（Windows / Linux）**
+
+- C 与 C++ 的 TCP 传输原先只有 Winsock 实现，本轮补了 POSIX 分支（`c/tcp.c`、`cpp/include/ipc/tcp.hpp`），同一份源码在两个平台编译；
+- C 的 `rpc.c` / `message_stream.c` 补 `_POSIX_C_SOURCE 200809L`（`clock_gettime`/`nanosleep`），测试里的 `Sleep()` 在非 Windows 下映射为 `nanosleep`；
+- Node 侧的管道在 Windows 是命名管道、在 Linux 是 Unix domain socket，`nativeService` 已有平台分支，回归在两端均通过。
+
+**4）P2 回归结果**
+
+| 平台 | 套件 | 结果 |
+| --- | --- | --- |
+| Windows | v1.1 / 鉴权+能力 / 守护 / 多客户端轮换 | 13 / 12 / 22 / 21 |
+| Windows | Python、C# 鉴权（good+bad） | 3+1、3+1 |
+| Windows | Java（含自动握手）/ Go / Rust / C++ / C | 32 / ok / 18 / 36 / 34 |
+| Windows | 守护：Python / C# / Java | 8 / 8 / 8 |
+| Linux | Node v1.1 / 鉴权+能力 / 守护 / 多客户端轮换 | 13 / 12 / 22 / 21 |
+| Linux | Python 自测 / Python 守护 / Go | 27 / 8 / ok |
+| Linux | C++ / C | 36 / 34 |
+| Linux | Java、Rust | 未执行（云主机无 javac / cargo，Windows 侧已验证） |
+
+**5）遗留说明**
+
+- Python ↔ Node 的命名管道互操作脚本（`tests/pipe_interop/py_named_pipe.py`）仍是 Windows 专用（走 `CreateFile`/`WaitNamedPipe`），Linux 上只验证了 Node 自环与各语言 TCP 自环；
+- 五语言的自动握手是"发送前拦截"，不改变显式 `hello()` 的既有语义；需要精细控制握手时机时可直接调用 `hello()` 并关闭自动路径（不传 token 即可）。

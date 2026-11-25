@@ -303,6 +303,47 @@ int main() {
         p->cli->close();
         p->server->close();
     }
+    // 20. v1.1.3 自动握手（P2）：不显式 hello，首个业务请求也能过鉴权
+    {
+        auto p = makePair(0, 0, "secret", "secret");
+        check("auto hello first request",
+              p->cli->sendRequest("add", Json::ofArr({Json::ofNum(2), Json::ofNum(3)})).asNum() == 5);
+        check("auto hello authSent", p->cli->authSent());
+        p->cli->close();
+        p->server->close();
+    }
+    // 21. 自动握手：并发首请求（8 线程）只握手一次，全部成功
+    {
+        auto p = makePair(0, 0, "secret", "secret");
+        std::vector<std::thread> threads;
+        std::vector<double> vals(8, -1);
+        for (int i = 0; i < 8; i++) {
+            threads.emplace_back([p, i, &vals]() {
+                try {
+                    vals[i] = p->cli->sendRequest("add", Json::ofArr({Json::ofNum(i), Json::ofNum(1)})).asNum();
+                } catch (...) { }
+            });
+        }
+        for (auto& t : threads) t.join();
+        bool ok = true;
+        for (int i = 0; i < 8; i++) ok = ok && vals[i] == i + 1;
+        check("auto hello concurrent one handshake", ok);
+        p->cli->close();
+        p->server->close();
+    }
+    // 22. 自动握手：错误 token -> EAUTH
+    {
+        auto p = makePair(0, 0, "wrong", "secret");
+        bool ok = false;
+        try {
+            p->cli->sendRequest("add", Json::ofArr({Json::ofNum(1), Json::ofNum(1)}));
+        } catch (const RpcException& e) {
+            ok = e.code == "EAUTH";
+        }
+        check("auto hello wrong token EAUTH", ok);
+        p->cli->close();
+        p->server->close();
+    }
     // 12. 未握手直接请求 -> Unauthorized 错误响应 + 断链
     {
         auto p = makePair(0, 0, "", "secret");

@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, Once, Weak};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -77,8 +77,23 @@ pub struct RpcProtocol {
     last_received: Arc<AtomicU64>,
     authenticated: Arc<AtomicBool>,
     auth_token: Option<String>,
+    // ---- v1.1.2: 能力协商（PROTOCOL.md §8.4） ----
+    capabilities: Vec<String>,
+    impl_name: String,
+    peer_capabilities: Mutex<Option<Vec<String>>>,
+    server_capabilities: Mutex<Option<Vec<String>>>,
+    heartbeat_disabled: Arc<AtomicBool>,
+    heartbeat_reason: Mutex<Option<String>>,
+    unauthorized_hits: AtomicU32,
+    // ---- v1.1.3: 首个业务请求前自动握手（P2） ----
+    needs_auth: bool,
+    auth_sent: AtomicBool,
+    auth_lock: Mutex<()>,
     close_once: Once,
 }
+
+/// v1.1.2 默认能力集合。
+pub const DEFAULT_CAPABILITIES: [&str; 3] = ["ping", "binary", "event"];
 
 fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
@@ -99,6 +114,13 @@ impl RpcProtocol {
         auth_token: Option<String>,
         required_token: Option<String>,
     ) -> Arc<Self> {
+        // v1.1.2：未显式传 token 时回退环境变量 IPC_TOKEN（Node 主进程注入）
+        let auth_token = auth_token
+            .filter(|t| !t.is_empty())
+            .or_else(|| std::env::var("IPC_TOKEN").ok().filter(|t| !t.is_empty()));
+        // v1.1.3：区分服务端校验位与客户端握手完成，避免客户端把自己当作已鉴权而跳过 HELLO
+        let needs_auth = required_token.is_some();
+        let initially_authenticated = required_token.is_none() && auth_token.is_none();
         let rpc = Arc::new(RpcProtocol {
             ms: ms.clone(),
             handlers: Arc::new(Mutex::new(HashMap::new())),
@@ -107,8 +129,18 @@ impl RpcProtocol {
             on_error: Arc::new(Mutex::new(None)),
             default_timeout_ms: AtomicU64::new(15000),
             last_received: Arc::new(AtomicU64::new(now_ms())),
-            authenticated: Arc::new(AtomicBool::new(required_token.is_none())),
+            authenticated: Arc::new(AtomicBool::new(initially_authenticated)),
             auth_token,
+            needs_auth,
+            auth_sent: AtomicBool::new(false),
+            auth_lock: Mutex::new(()),
+            capabilities: DEFAULT_CAPABILITIES.iter().map(|s| s.to_string()).collect(),
+            impl_name: "rust".to_string(),
+            peer_capabilities: Mutex::new(None),
+            server_capabilities: Mutex::new(None),
+            heartbeat_disabled: Arc::new(AtomicBool::new(false)),
+            heartbeat_reason: Mutex::new(None),
+            unauthorized_hits: AtomicU32::new(0),
             close_once: Once::new(),
         });
 
@@ -152,6 +184,9 @@ impl RpcProtocol {
                     None => return,
                 };
                 if rpc.ms.is_closed() {
+                    return;
+                }
+                if rpc.heartbeat_disabled.load(Ordering::SeqCst) {
                     return;
                 }
                 let silent = now_ms().saturating_sub(rpc.last_received.load(Ordering::SeqCst));
@@ -212,6 +247,7 @@ impl RpcProtocol {
 
     /// 带 to 路由与显式超时的请求；超时返回 RpcError::Timeout（code=ETIMEDOUT），对齐 JS 修复版。
     pub fn send_request_to_timeout(&self, method: &str, params: Json, to: Option<&str>, timeout: Duration) -> Result<Json, RpcError> {
+        self.ensure_auth()?;
         let id = new_uuid();
         let (tx, rx) = mpsc::channel();
         self.pending.lock().unwrap().insert(id.clone(), tx);
@@ -237,6 +273,7 @@ impl RpcProtocol {
 
     /// 带显式超时的二进制请求；Duration::ZERO 关闭超时。
     pub fn send_request_binary_timeout(&self, method: &str, data: &[u8], args: Vec<Json>, timeout: Duration) -> Result<Json, RpcError> {
+        self.ensure_auth()?;
         let id = new_uuid();
         let (tx, rx) = mpsc::channel();
         self.pending.lock().unwrap().insert(id.clone(), tx);
@@ -307,6 +344,8 @@ impl RpcProtocol {
 
         let mut payload = Json::obj();
         payload.insert("version", Json::Num(PROTOCOL_VERSION));
+        payload.insert("caps", Json::Arr(self.capabilities.iter().map(|s| Json::Str(s.clone())).collect()));
+        payload.insert("impl", Json::Str(self.impl_name.clone()));
         if let Some(token) = &self.auth_token {
             payload.insert("token", Json::Str(token.clone()));
         }
@@ -316,6 +355,54 @@ impl RpcProtocol {
             return Err(RpcError::Message(e.to_string()));
         }
         self.wait_result(&id, rx, "hello", timeout)
+    }
+
+    // ---- v1.1.3: 自动握手（P2） ----
+
+    /// 首个业务请求前自动 HELLO：仅客户端（needs_auth == false 且持有 token）生效；
+    /// 并发调用由 auth_lock 串行化，只握手一次。
+    fn ensure_auth(&self) -> Result<(), RpcError> {
+        if self.needs_auth || self.auth_token.is_none() {
+            return Ok(());
+        }
+        if self.authenticated.load(Ordering::SeqCst) || self.auth_sent.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let _guard = self.auth_lock.lock().unwrap();
+        if self.authenticated.load(Ordering::SeqCst) || self.auth_sent.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        self.hello()?;
+        self.auth_sent.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// 是否已完成（或被跳过）自动握手。
+    pub fn auth_sent(&self) -> bool {
+        self.auth_sent.load(Ordering::SeqCst) || self.authenticated.load(Ordering::SeqCst)
+    }
+
+    // ---- v1.1.2: 能力协商（PROTOCOL.md §8.4） ----
+
+    /// 本端声明的能力。
+    pub fn capabilities(&self) -> Vec<String> { self.capabilities.clone() }
+
+    /// 对端在 HELLO 中声明的能力（None = 旧实现）。
+    pub fn peer_capabilities(&self) -> Option<Vec<String>> { self.peer_capabilities.lock().unwrap().clone() }
+
+    /// 客户端收到 HELLO_ACK 里服务端声明的能力。
+    pub fn server_capabilities(&self) -> Option<Vec<String>> { self.server_capabilities.lock().unwrap().clone() }
+
+    /// 因能力协商停用心跳的原因（None = 心跳正常）。
+    pub fn heartbeat_disabled_reason(&self) -> Option<String> { self.heartbeat_reason.lock().unwrap().clone() }
+
+    pub fn set_impl_name(&mut self, name: &str) { self.impl_name = name.to_string(); }
+
+    fn disable_heartbeat(&self, reason: &str) {
+        if self.heartbeat_disabled.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        *self.heartbeat_reason.lock().unwrap() = Some(reason.to_string());
     }
 }
 
@@ -365,10 +452,13 @@ fn handle_message(
 
     match msg_type {
         TYPE_REQUEST => {
-            if !authenticated.load(Ordering::SeqCst) {
+            if required_token.is_some() && !authenticated.load(Ordering::SeqCst) {
                 send_error_response(ms, &id, "Unauthorized");
+                // v1.1.2：回错误但不断链（允许随后 HELLO 重试）；连续 5 次才断开
                 if let Some(rpc) = rpc_weak.upgrade() {
-                    rpc.close();
+                    if rpc.unauthorized_hits.fetch_add(1, Ordering::SeqCst) >= 4 {
+                        rpc.close();
+                    }
                 }
                 return;
             }
@@ -392,7 +482,7 @@ fn handle_message(
             }
         }
         TYPE_EVENT => {
-            if !authenticated.load(Ordering::SeqCst) {
+            if required_token.is_some() && !authenticated.load(Ordering::SeqCst) {
                 return; // 未鉴权事件直接丢弃
             }
             let cb = on_event.lock().unwrap();
@@ -409,8 +499,20 @@ fn handle_message(
         TYPE_HELLO => handle_hello(ms, &id, &content, authenticated, required_token, rpc_weak),
         TYPE_HELLO_ACK => {
             let tx = pending.lock().unwrap().remove(&id);
+            let parsed = parse_hello_ack(&content);
             if let Some(tx) = tx {
-                let _ = tx.send(parse_hello_ack(&content));
+                if parsed.is_ok() {
+                    if let Some(rpc) = rpc_weak.upgrade() {
+                        let caps = read_caps(&content);
+                        *rpc.server_capabilities.lock().unwrap() = caps.clone();
+                        if let Some(list) = caps {
+                            if !list.iter().any(|s| s == "ping") {
+                                rpc.disable_heartbeat("server declares no 'ping' capability");
+                            }
+                        }
+                    }
+                }
+                let _ = tx.send(parsed);
             }
         }
         _ => eprintln!("[ipc] unknown message type: {}", msg_type),
@@ -445,6 +547,19 @@ fn handle_hello(
         } else {
             authenticated.store(true, Ordering::SeqCst);
             ack.insert("ok", Json::Bool(true));
+            if let Some(rpc) = rpc_weak.upgrade() {
+                ack.insert("caps", Json::Arr(rpc.capabilities.iter().map(|s| Json::Str(s.clone())).collect()));
+                ack.insert("impl", Json::Str(rpc.impl_name.clone()));
+                // v1.1.2：记录对端能力；对端不支持 PING 则本端停用心跳
+                let peer = read_caps(content);
+                if let Some(list) = &peer {
+                    if !list.iter().any(|s| s == "ping") {
+                        let impl_name = content.get("impl").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+                        rpc.disable_heartbeat(&format!("peer {} declares no 'ping' capability", impl_name));
+                    }
+                }
+                *rpc.peer_capabilities.lock().unwrap() = peer;
+            }
             ok = true;
         }
     } else {
@@ -455,10 +570,26 @@ fn handle_hello(
         eprintln!("[ipc] send hello ack failed: {}", e);
     }
     if !ok {
+        // v1.1.2：先让 ack 刷到对端再断链（立即 close 会丢掉未送达的 ack）
         if let Some(rpc) = rpc_weak.upgrade() {
-            rpc.close(); // 握手失败后服务端断链
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(300));
+                rpc.close();
+            });
         }
     }
+}
+
+/// 解析 HELLO / HELLO_ACK 中的 caps 字段；缺失返回 None（旧实现）。
+fn read_caps(content: &Json) -> Option<Vec<String>> {
+    let arr = content.get("caps")?.as_arr()?.clone();
+    let mut out = Vec::new();
+    for item in arr {
+        if let Some(s) = item.as_str() {
+            out.push(s.to_string());
+        }
+    }
+    Some(out)
 }
 
 /// 客户端 HELLO_ACK 解析：error → EAUTH，版本不符 → EVERSION。

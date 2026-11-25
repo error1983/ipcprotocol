@@ -528,3 +528,54 @@ func TestResyncTimeout(t *testing.T) {
 		}
 	}
 }
+
+func TestAutoHelloFirstRequest(t *testing.T) {
+	p := newPair(t, 0, 0, "secret", "secret")
+	defer p.close()
+	// 不显式 Hello，直接业务请求
+	if v, err := p.cli.SendRequest("add", []any{2, 3}); err != nil || v.(float64) != 5 {
+		t.Fatalf("auto hello first request: %v %v", v, err)
+	}
+	if !p.cli.AuthSent() {
+		t.Fatal("authSent should be true after auto hello")
+	}
+}
+
+func TestAutoHelloConcurrent(t *testing.T) {
+	p := newPair(t, 0, 0, "secret", "secret")
+	defer p.close()
+	var wg sync.WaitGroup
+	errs := make([]error, 8)
+	vals := make([]float64, 8)
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			v, err := p.cli.SendRequest("add", []any{float64(i), 1})
+			if err != nil {
+				errs[i] = err
+				return
+			}
+			vals[i] = v.(float64)
+		}(i)
+	}
+	wg.Wait()
+	for i := 0; i < 8; i++ {
+		if errs[i] != nil {
+			t.Fatalf("concurrent auto hello[%d]: %v", i, errs[i])
+		}
+		if vals[i] != float64(i+1) {
+			t.Fatalf("concurrent auto hello[%d] value = %v", i, vals[i])
+		}
+	}
+}
+
+func TestAutoHelloWrongToken(t *testing.T) {
+	p := newPair(t, 0, 0, "wrong", "secret")
+	defer p.close()
+	_, err := p.cli.SendRequest("add", []any{1, 1})
+	re, ok := err.(*RpcError)
+	if !ok || re.Code != "EAUTH" {
+		t.Fatalf("auto hello wrong token err = %v", err)
+	}
+}

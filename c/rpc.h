@@ -34,6 +34,18 @@ void rpc_on_error(RpcProtocol* rpc, void (*cb)(void* user, const char* msg, cons
 /* 发起 HELLO 握手（版本协商 + 可选鉴权）。timeoutMs<0 用默认超时，0 关闭超时。
  * 成功返回 value=ACK 对象；ACK error → code="EAUTH"，版本不符 → code="EVERSION"。 */
 RpcResult rpc_hello(RpcProtocol* rpc, int timeoutMs);
+/* v1.1.3：是否已完成（或被跳过）自动握手 */
+int rpc_auth_sent(RpcProtocol* rpc);
+
+/* v1.1.2 能力协商（PROTOCOL.md §8.4）：返回逗号分隔的能力串（借用，勿释放）。
+ * peer_caps / server_caps 为 NULL 表示对端未声明（旧实现）。 */
+const char* rpc_capabilities(RpcProtocol* rpc);
+const char* rpc_peer_capabilities(RpcProtocol* rpc);
+const char* rpc_server_capabilities(RpcProtocol* rpc);
+/* 因能力协商停用心跳的原因；NULL 表示心跳正常。 */
+const char* rpc_heartbeat_disabled_reason(RpcProtocol* rpc);
+/* 覆盖本端能力声明与实现名（HELLO/HELLO_ACK 使用）。 */
+void rpc_set_capabilities(RpcProtocol* rpc, const char* capsCsv, const char* implName);
 
 /* 默认 RPC 超时（毫秒），对齐 JS 修复版 15s；0 表示关闭。 */
 void rpc_set_default_timeout(RpcProtocol* rpc, int timeoutMs);

@@ -118,4 +118,126 @@ inline std::shared_ptr<TcpStream> tcpConnect(const std::string& host, uint16_t p
 
 } // namespace ipc
 
-#endif // _WIN32
+
+#else // ---- POSIX（Linux/macOS）----
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include <cerrno>
+#include <memory>
+#include <stdexcept>
+#include <string>
+
+#include "message_stream.hpp"
+
+namespace ipc {
+
+class TcpStream : public ByteStream {
+public:
+    explicit TcpStream(int fd) : fd_(fd) {}
+    ~TcpStream() override { close(); }
+
+    int read(uint8_t* buf, int max) override {
+        ssize_t n;
+        do { n = ::recv(fd_, buf, static_cast<size_t>(max), 0); } while (n < 0 && errno == EINTR);
+        if (n <= 0) return n == 0 ? -1 : -1;
+        return static_cast<int>(n);
+    }
+
+    bool write(const uint8_t* data, size_t len) override {
+        size_t off = 0;
+        while (off < len) {
+            ssize_t n = ::send(fd_, data + off, len - off, MSG_NOSIGNAL);
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                return false;
+            }
+            if (n == 0) return false;
+            off += static_cast<size_t>(n);
+        }
+        return true;
+    }
+
+    void close() override {
+        int fd = fd_;
+        if (fd >= 0) {
+            fd_ = -1;
+            ::shutdown(fd, SHUT_RDWR);
+            ::close(fd);
+        }
+    }
+
+    int native() const { return fd_; }
+
+private:
+    int fd_;
+};
+
+class TcpListener {
+public:
+    TcpListener(const std::string& host, uint16_t port) {
+        fd_ = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (fd_ < 0) throw std::runtime_error("socket failed");
+        int one = 1;
+        ::setsockopt(fd_, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(port);
+        if (::inet_pton(AF_INET, host.c_str(), &addr.sin_addr) != 1) {
+            ::close(fd_);
+            throw std::runtime_error("bad host");
+        }
+        if (::bind(fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+            ::close(fd_);
+            throw std::runtime_error("bind failed");
+        }
+        if (::listen(fd_, 16) != 0) {
+            ::close(fd_);
+            throw std::runtime_error("listen failed");
+        }
+        socklen_t len = sizeof(addr);
+        ::getsockname(fd_, reinterpret_cast<sockaddr*>(&addr), &len);
+        port_ = ntohs(addr.sin_port);
+    }
+
+    ~TcpListener() {
+        if (fd_ >= 0) ::close(fd_);
+    }
+
+    uint16_t port() const { return port_; }
+
+    std::shared_ptr<TcpStream> accept() {
+        int c = ::accept(fd_, nullptr, nullptr);
+        if (c < 0) throw std::runtime_error("accept failed");
+        return std::make_shared<TcpStream>(c);
+    }
+
+private:
+    int fd_ = -1;
+    uint16_t port_ = 0;
+};
+
+inline std::shared_ptr<TcpStream> tcpConnect(const std::string& host, uint16_t port) {
+    int s = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (s < 0) throw std::runtime_error("socket failed");
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    if (::inet_pton(AF_INET, host.c_str(), &addr.sin_addr) != 1) {
+        ::close(s);
+        throw std::runtime_error("bad host");
+    }
+    if (::connect(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+        ::close(s);
+        throw std::runtime_error("connect failed");
+    }
+    return std::make_shared<TcpStream>(s);
+}
+
+} // namespace ipc
+
+#endif

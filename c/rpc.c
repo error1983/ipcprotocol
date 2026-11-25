@@ -1,3 +1,7 @@
+#if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 #include "rpc.h"
 
 #include <errno.h>
@@ -74,6 +78,17 @@ struct RpcProtocol {
     pthread_cond_t hb_cv;
     int hb_started;
     pthread_t hb_thread;
+    /* v1.1.2：能力协商（PROTOCOL.md §8.4） */
+    char* caps;        /* 本端声明，逗号分隔 */
+    char* impl_name;
+    char* peer_caps;   /* 对端 HELLO 声明的能力；NULL = 旧实现 */
+    char* server_caps; /* 客户端侧 HELLO_ACK 声明的能力 */
+    int hb_disabled;
+    char hb_reason[160];
+    int unauth_hits;
+    /* v1.1.3：首个业务请求前自动握手（P2） */
+    int auth_sent;
+    pthread_mutex_t auth_mu;
 };
 
 typedef struct {
@@ -381,6 +396,57 @@ static void* request_thread(void* arg) {
 
 /* ---- v1.1：HELLO 握手与心跳 ---- */
 
+/* v1.1.2：把 HELLO/HELLO_ACK 的 caps 数组拼成逗号串；未声明返回 NULL（旧实现） */
+static char* caps_csv(const JsonValue* content) {
+    if (!content || content->type != JSON_OBJ) return NULL;
+    JsonValue* caps = json_get(content, "caps");
+    if (!caps || caps->type != JSON_ARR) return NULL;
+    size_t cap = 64 + caps->u.arr.len * 24;
+    char* out = (char*)calloc(cap, 1);
+    size_t used = 0;
+    for (size_t i = 0; i < caps->u.arr.len; i++) {
+        JsonValue* it = caps->u.arr.items[i];
+        if (!it || it->type != JSON_STR) continue;
+        size_t n = strlen(it->u.str);
+        if (used + n + 2 >= cap) break;
+        if (used) out[used++] = ',';
+        memcpy(out + used, it->u.str, n);
+        used += n;
+    }
+    out[used] = '\0';
+    return out;
+}
+
+static int caps_has_ping(const char* csv) {
+    if (!csv) return 0;
+    const char* p = csv;
+    while (p && *p) {
+        const char* comma = strchr(p, ',');
+        size_t n = comma ? (size_t)(comma - p) : strlen(p);
+        if (n == 4 && memcmp(p, "ping", 4) == 0) return 1;
+        p = comma ? comma + 1 : NULL;
+    }
+    return 0;
+}
+
+/* 逗号串 → JSON 数组（用于 ACK 回传） */
+static JsonValue* caps_to_json(const char* csv) {
+    JsonValue* arr = json_arr();
+    if (csv && csv[0]) {
+        const char* p = csv;
+        while (p && *p) {
+            const char* comma = strchr(p, ',');
+            size_t n = comma ? (size_t)(comma - p) : strlen(p);
+            char* item = (char*)calloc(n + 1, 1);
+            memcpy(item, p, n);
+            json_arr_push(arr, json_str(item));
+            free(item);
+            p = comma ? comma + 1 : NULL;
+        }
+    }
+    return arr;
+}
+
 /* 服务端 HELLO 处理：版本/token 校验，失败回 error ACK 后断链。 */
 static void handle_hello(RpcProtocol* rpc, const char* id, JsonValue* content) {
     JsonValue* ack = json_obj();
@@ -396,10 +462,28 @@ static void handle_hello(RpcProtocol* rpc, const char* id, JsonValue* content) {
             int need = req && req[0];
             JsonValue* t = json_get(content, "token");
             int tokOk = !need || (t && t->type == JSON_STR && strcmp(t->u.str, req) == 0);
-            if (tokOk) { rpc->authenticated = 1; ok = 1; }
+            if (tokOk) {
+                rpc->authenticated = 1;
+                /* v1.1.2：记录对端能力；对端声明了但不含 ping → 停用心跳 */
+                free(rpc->peer_caps);
+                rpc->peer_caps = caps_csv(content);
+                if (rpc->peer_caps && !caps_has_ping(rpc->peer_caps)) {
+                    JsonValue* impl = json_get(content, "impl");
+                    const char* name = (impl && impl->type == JSON_STR) ? impl->u.str : "unknown";
+                    rpc->hb_disabled = 1;
+                    snprintf(rpc->hb_reason, sizeof(rpc->hb_reason),
+                             "peer %s declares no 'ping' capability", name);
+                }
+                ok = 1;
+            }
             pthread_mutex_unlock(&rpc->mu);
-            if (ok) json_obj_set(ack, "ok", json_bool(1));
-            else json_obj_set(ack, "error", json_str("Unauthorized"));
+            if (ok) {
+                json_obj_set(ack, "ok", json_bool(1));
+                json_obj_set(ack, "caps", caps_to_json(rpc->caps));
+                json_obj_set(ack, "impl", json_str(rpc->impl_name ? rpc->impl_name : "c"));
+            } else {
+                json_obj_set(ack, "error", json_str("Unauthorized"));
+            }
         }
     } else {
         json_obj_set(ack, "error", json_str("Invalid hello payload"));
@@ -411,7 +495,7 @@ static void handle_hello(RpcProtocol* rpc, const char* id, JsonValue* content) {
     free(m);
     free(body);
     json_free(ack);
-    if (!ok) rpc_close(rpc);
+    if (!ok) rpc_close(rpc);   /* C 版 ms_send 为同步写，ack 已进内核缓冲，可直接断链 */
 }
 
 /* 客户端 HELLO_ACK 解析：error → EAUTH，版本不符 → EVERSION。 */
@@ -437,6 +521,19 @@ static void handle_hello_ack(RpcProtocol* rpc, const char* id, JsonValue* conten
     char* s = json_dump(content);
     JsonValue* copy = json_parse(s);
     free(s);
+    /* v1.1.2：记录服务端能力；服务端不支持 PING 则本端停用心跳 */
+    {
+        char* caps = caps_csv(content);
+        free(rpc->server_caps);
+        rpc->server_caps = caps;
+        if (caps && !caps_has_ping(caps)) {
+            pthread_mutex_lock(&rpc->mu);
+            rpc->hb_disabled = 1;
+            snprintf(rpc->hb_reason, sizeof(rpc->hb_reason), "server declares no 'ping' capability");
+            pthread_cond_broadcast(&rpc->hb_cv);
+            pthread_mutex_unlock(&rpc->mu);
+        }
+    }
     deliver(p, copy ? copy : json_null(), NULL, 0, NULL);
 }
 
@@ -452,11 +549,13 @@ static void* heartbeat_thread(void* arg) {
         if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
         while (!rpc->closed && pthread_cond_timedwait(&rpc->hb_cv, &rpc->mu, &ts) != ETIMEDOUT) {}
         int closed = rpc->closed;
+        int disabled = rpc->hb_disabled;
         long long last = rpc->last_received_ms;
         int timeout = rpc->heartbeat_timeout_ms;
         int interval = rpc->heartbeat_interval_ms;
         pthread_mutex_unlock(&rpc->mu);
         if (closed) return NULL;
+        if (disabled) return NULL;   /* v1.1.2：能力协商停用心跳 */
         long long silent = now_ms() - last;
         if (timeout > 0 && silent >= timeout) {
             char msg[128];
@@ -528,10 +627,15 @@ static void on_stream_message(void* user, const unsigned char* data, size_t len)
     if (msgType == TYPE_REQUEST) {
         pthread_mutex_lock(&rpc->mu);
         int authed = rpc->authenticated;
+        int needs_auth = rpc->required_token && rpc->required_token[0];
         pthread_mutex_unlock(&rpc->mu);
-        if (!authed) {
+        if (needs_auth && !authed) {
             send_response(rpc, id, NULL, "Unauthorized");
-            rpc_close(rpc);
+            /* v1.1.2：回错误但不断链（允许随后 HELLO 重试）；连续 5 次才断开 */
+            pthread_mutex_lock(&rpc->mu);
+            int hits = ++rpc->unauth_hits;
+            pthread_mutex_unlock(&rpc->mu);
+            if (hits >= 5) rpc_close(rpc);
             json_free(content);
             return;
         }
@@ -577,10 +681,11 @@ static void on_stream_message(void* user, const unsigned char* data, size_t len)
     } else if (msgType == TYPE_EVENT) {
         pthread_mutex_lock(&rpc->mu);
         int authed = rpc->authenticated;
+        int needs_auth = rpc->required_token && rpc->required_token[0];
         void (*cb)(void*, int, JsonValue*) = rpc->event_cb;
         void* cbUser = rpc->event_user;
         pthread_mutex_unlock(&rpc->mu);
-        if (authed && cb) cb(cbUser, contentType, content);
+        if ((!needs_auth || authed) && cb) cb(cbUser, contentType, content);
         json_free(content);
     } else {
         json_free(content);
@@ -611,11 +716,18 @@ RpcProtocol* rpc_create_options(MessageStream* ms, int heartbeatIntervalMs, int 
     rpc->default_timeout_ms = 15000;
     rpc->heartbeat_interval_ms = heartbeatIntervalMs;
     rpc->heartbeat_timeout_ms = heartbeatTimeoutMs;
-    rpc->auth_token = authToken ? dup_cstr(authToken) : NULL;
+    /* v1.1.2：未显式传 token 时回退环境变量 IPC_TOKEN（Node 主进程注入） */
+    const char* envToken = getenv("IPC_TOKEN");
+    const char* token = (authToken && authToken[0]) ? authToken : ((envToken && envToken[0]) ? envToken : NULL);
+    rpc->auth_token = token ? dup_cstr(token) : NULL;
     rpc->required_token = requiredToken ? dup_cstr(requiredToken) : NULL;
-    rpc->authenticated = !(requiredToken && requiredToken[0]);
+    rpc->caps = dup_cstr("ping,binary,event");
+    rpc->impl_name = dup_cstr("c");
+    /* v1.1.3：区分服务端校验位与客户端握手完成，否则客户端会把自己当作已鉴权而跳过 HELLO */
+    rpc->authenticated = !(requiredToken && requiredToken[0]) && !(token && token[0]);
     rpc->last_received_ms = now_ms();
     pthread_mutex_init(&rpc->mu, NULL);
+    pthread_mutex_init(&rpc->auth_mu, NULL);
     pthread_cond_init(&rpc->active_cv, NULL);
     pthread_cond_init(&rpc->hb_cv, NULL);
     ms_on_message(ms, on_stream_message, rpc);
@@ -637,6 +749,8 @@ RpcResult rpc_hello(RpcProtocol* rpc, int timeoutMs) {
     Pending* p = pending_new(rpc);
     JsonValue* payload = json_obj();
     json_obj_set(payload, "version", json_num(PROTOCOL_VERSION));
+    json_obj_set(payload, "caps", caps_to_json(rpc->caps));
+    json_obj_set(payload, "impl", json_str(rpc->impl_name ? rpc->impl_name : "c"));
     if (rpc->auth_token && rpc->auth_token[0])
         json_obj_set(payload, "token", json_str(rpc->auth_token));
     char* body = json_dump(payload);
@@ -656,6 +770,25 @@ RpcResult rpc_hello(RpcProtocol* rpc, int timeoutMs) {
 
 void rpc_set_default_timeout(RpcProtocol* rpc, int timeoutMs) {
     rpc->default_timeout_ms = timeoutMs;
+}
+
+/* ---- v1.1.2 能力协商访问器 ---- */
+const char* rpc_capabilities(RpcProtocol* rpc) { return rpc->caps; }
+const char* rpc_peer_capabilities(RpcProtocol* rpc) { return rpc->peer_caps; }
+const char* rpc_server_capabilities(RpcProtocol* rpc) { return rpc->server_caps; }
+const char* rpc_heartbeat_disabled_reason(RpcProtocol* rpc) {
+    return rpc->hb_disabled ? rpc->hb_reason : NULL;
+}
+
+void rpc_set_capabilities(RpcProtocol* rpc, const char* capsCsv, const char* implName) {
+    if (capsCsv) {
+        free(rpc->caps);
+        rpc->caps = dup_cstr(capsCsv);
+    }
+    if (implName) {
+        free(rpc->impl_name);
+        rpc->impl_name = dup_cstr(implName);
+    }
 }
 
 void rpc_register(RpcProtocol* rpc, const char* name, IpcHandler h, void* user) {
@@ -754,12 +887,51 @@ static Pending* pending_new(RpcProtocol* rpc) {
     return p;
 }
 
+/* v1.1.3：首个业务请求前自动 HELLO。仅客户端（无 required_token 且持有 auth_token）生效；锁内只握手一次。 */
+static RpcResult rpc_ensure_auth(RpcProtocol* rpc) {
+    RpcResult ok = {0};
+    ok.value = NULL; ok.error = NULL; ok.remote = 0; ok.code = NULL;
+    if (rpc->required_token && rpc->required_token[0]) return ok;   /* 服务端角色 */
+    if (!rpc->auth_token || !rpc->auth_token[0]) return ok;         /* 无 token，无需握手 */
+    pthread_mutex_lock(&rpc->mu);
+    int done = rpc->authenticated || rpc->auth_sent;
+    pthread_mutex_unlock(&rpc->mu);
+    if (done) return ok;
+
+    pthread_mutex_lock(&rpc->auth_mu);
+    pthread_mutex_lock(&rpc->mu);
+    done = rpc->authenticated || rpc->auth_sent;
+    pthread_mutex_unlock(&rpc->mu);
+    if (!done) {
+        RpcResult hr = rpc_hello(rpc, rpc->default_timeout_ms);
+        if (hr.error) {
+            pthread_mutex_unlock(&rpc->auth_mu);
+            return hr;
+        }
+        rpc_result_free(&hr);
+        pthread_mutex_lock(&rpc->mu);
+        rpc->auth_sent = 1;
+        pthread_mutex_unlock(&rpc->mu);
+    }
+    pthread_mutex_unlock(&rpc->auth_mu);
+    return ok;
+}
+
+int rpc_auth_sent(RpcProtocol* rpc) {
+    pthread_mutex_lock(&rpc->mu);
+    int v = rpc->auth_sent || rpc->authenticated;
+    pthread_mutex_unlock(&rpc->mu);
+    return v;
+}
+
 RpcResult rpc_send_request(RpcProtocol* rpc, const char* method, JsonValue* params, const char* to) {
     return rpc_send_request_timeout(rpc, method, params, to, rpc->default_timeout_ms);
 }
 
 RpcResult rpc_send_request_timeout(RpcProtocol* rpc, const char* method, JsonValue* params, const char* to,
                                    int timeoutMs) {
+    RpcResult ar = rpc_ensure_auth(rpc);
+    if (ar.error) return ar;
     Pending* p = pending_new(rpc);
     /* 组装 {"method":...,"params":...[,"to":...]}（params 借用，单独 dump） */
     JsonValue* mv = json_str(method);
@@ -794,6 +966,8 @@ RpcResult rpc_send_request_binary(RpcProtocol* rpc, const char* method,
 RpcResult rpc_send_request_binary_timeout(RpcProtocol* rpc, const char* method,
                                           const unsigned char* data, size_t len, JsonValue* argsArr,
                                           int timeoutMs) {
+    RpcResult ar = rpc_ensure_auth(rpc);
+    if (ar.error) return ar;
     Pending* p = pending_new(rpc);
     size_t bodyLen;
     unsigned char* body = encode_binary_request(method, data, len, argsArr, &bodyLen);
@@ -871,7 +1045,12 @@ void rpc_destroy(RpcProtocol* rpc) {
     }
     free(rpc->auth_token);
     free(rpc->required_token);
+    free(rpc->caps);
+    free(rpc->impl_name);
+    free(rpc->peer_caps);
+    free(rpc->server_caps);
     pthread_mutex_destroy(&rpc->mu);
+    pthread_mutex_destroy(&rpc->auth_mu);
     pthread_cond_destroy(&rpc->active_cv);
     pthread_cond_destroy(&rpc->hb_cv);
     free(rpc);

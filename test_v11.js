@@ -64,8 +64,9 @@ function badCrcFrame() {
     const srv = net.createServer(() => { });   // 接受连接后完全静默
     const port = await listen(srv);
     const sock = await connect(port);
+    // v1.1.1 起默认有在途请求时不断链（避免长任务被误杀），本用例专测心跳断链，故显式关闭该豁免
     const rpc = new RpcProtocol(new MessageStream({ socket: sock }),
-        { heartbeatIntervalMs: 100, heartbeatTimeoutMs: 300 });
+        { heartbeatIntervalMs: 100, heartbeatTimeoutMs: 300, heartbeatSkipWhilePending: false });
     let errCode = null;
     rpc.on('error', e => { errCode = e.code; });
     const p = rpc.sendRequest('add', [1, 2], undefined, 0);   // 关闭 RPC 超时，只靠心跳
@@ -93,7 +94,7 @@ function badCrcFrame() {
         { authToken: 'wrong' }, { requiredToken: 'secret' });
     await assert.rejects(clientRpc.hello(), e => e.code === 'EAUTH');
     check('hello wrong token EAUTH', true);
-    await sleep(100);
+    await sleep(600);   // v1.1.2：ack 先落地，300ms 后再断链
     check('auth fail closes server', serverRpc._destroyed === true);
     clientRpc.destroy(); srv.close();
 }

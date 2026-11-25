@@ -298,6 +298,33 @@ public class LoopbackTest {
         check("resync timeout closes stream", ms18.isClosed());
         cli18.close(); ln18.close();
 
+        // 20. v1.1.3 自动 hello（P2）：客户端不显式 hello，首个业务请求也能过鉴权
+        Pair pA = pair(0, 0, "tok-auto", "tok-auto");
+        check("auto hello: first request authorized",
+                ((Number) pA.cli.sendRequest("add", Arrays.asList(2, 3)).get(3, TimeUnit.SECONDS)).longValue() == 5);
+        check("auto hello: auth sent flag", pA.cli.isAuthSent());
+        pA.cli.close();
+
+        Pair pB = pair(0, 0, "tok-auto", "tok-auto");
+        List<CompletableFuture<Object>> autoFutures = new ArrayList<>();
+        for (int i = 0; i < 5; i++) autoFutures.add(pB.cli.sendRequest("add", Arrays.asList(i, 1)));
+        boolean autoAllOk = true;
+        for (int i = 0; i < 5; i++) {
+            autoAllOk &= ((Number) autoFutures.get(i).get(3, TimeUnit.SECONDS)).longValue() == i + 1;
+        }
+        check("auto hello: concurrent first requests only one handshake", autoAllOk);
+        pB.cli.close();
+
+        Pair pC = pair(0, 0, "bad-token", "tok-auto");
+        try {
+            pC.cli.sendRequest("add", Arrays.asList(1, 1)).get(3, TimeUnit.SECONDS);
+            check("auto hello: wrong token rejected", false);
+        } catch (java.util.concurrent.ExecutionException e) {
+            check("auto hello: wrong token rejected",
+                    "EAUTH".equals(((RpcProtocol.RpcException) e.getCause()).getCode()));
+        }
+        pC.cli.close();
+
         // 19. destroy 后资源清理
         client.close();
         serverSocket.close();

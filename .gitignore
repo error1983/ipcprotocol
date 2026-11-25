@@ -14,3 +14,7 @@ coverage
 **/__pycache__/
 *.pyc
 java/dbg*.txt
+
+# 本地测试输出（日志/二进制）
+_test-out/
+*.zip

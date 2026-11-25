@@ -7,6 +7,9 @@ export { uuidv4 }
 
 const DEFAULT_TIMEOUT = 15000;
 const PROTOCOL_VERSION = 1;
+// v1.1.2 能力协商：HELLO/HELLO_ACK 里声明，服务端据此决定是否启用心跳（PROTOCOL.md §8.4）
+const CAPABILITIES = Object.freeze(['ping', 'binary', 'event']);
+const IMPL_NAME = 'node';
 
 export class RpcError extends Error {
     constructor(message, { code = 'RPC_ERROR', remote = false, data = undefined } = {}) {
@@ -30,9 +33,25 @@ export class RpcProtocol extends EventEmitter {
         // v1.1：心跳与可选 HELLO 握手（PROTOCOL.md §8.1/§8.2）
         this.heartbeatIntervalMs = options.heartbeatIntervalMs ?? 5000;
         this.heartbeatTimeoutMs = options.heartbeatTimeoutMs ?? 15000;
+        // 有在途请求时不断链（对端长任务/阻塞期间不回 PONG 属正常），由请求级超时兜底
+        this.heartbeatSkipWhilePending = options.heartbeatSkipWhilePending ?? true;
         this.authToken = options.authToken ?? null;
         this.requiredToken = options.requiredToken ?? null;
-        this._authenticated = false;
+        // v1.1.2：支持 token 轮换 —— 服务端可同时接受多个 token（旧 token 宽限期）
+        this.requiredTokens = new Set(
+            options.requiredTokens ?? (this.requiredToken ? [this.requiredToken] : []),
+        );
+        this._authenticated = this.requiredTokens.size === 0;
+
+        // v1.1.2 能力协商
+        this.capabilities = Array.isArray(options.capabilities) ? options.capabilities : CAPABILITIES.slice();
+        this.implName = options.implName ?? IMPL_NAME;
+        // 严格模式：必须由对端在 HELLO 里声明 "ping" 才发心跳（对旧实现最安全）
+        this.heartbeatRequireCapability = options.heartbeatRequireCapability ?? false;
+        this.peerCapabilities = null;      // 对端在 HELLO 里声明的能力
+        this.serverCapabilities = null;    // 客户端收到 HELLO_ACK 里服务端声明的能力
+        this.heartbeatDisabledReason = null;
+
         this._lastReceived = Date.now();
         this._heartbeatTimer = null;
         if (this.heartbeatIntervalMs > 0) {
@@ -46,10 +65,16 @@ export class RpcProtocol extends EventEmitter {
             this._safeEmit('error', error);
         };
         this._onSync = () => this.emit('syncComplete');   // 信息类事件，无监听器不报错
+        this._onClose = () => {
+            // 流被显式销毁或对端关闭：结算所有在途请求，并停掉心跳，避免残留计时器
+            this.handleStreamError(new RpcError('stream closed', { code: 'ECLOSED' }));
+            if (this._heartbeatTimer) { clearInterval(this._heartbeatTimer); this._heartbeatTimer = null; }
+        };
 
         this.messageStream.on('message', this._onMessage);
         this.messageStream.on('error', this._onStreamError);
         this.messageStream.on('syncComplete', this._onSync);
+        this.messageStream.on('close', this._onClose);
     }
 
     _safeEmit(event, payload) {
@@ -198,19 +223,22 @@ export class RpcProtocol extends EventEmitter {
         }
 
         if (type === RpcProtocol.TYPES.REQUEST) {
-            if (this.requiredToken && !this._authenticated) {
-                this.sendResponse(id, { error: 'Unauthorized' }, RpcProtocol.CONTENT_TYPES.JSON)
-                    .then(() => this.destroy()).catch(() => this.destroy());
+            if (this.requiredTokens.size > 0 && !this._authenticated) {
+                // 未鉴权：回错误但不断链（允许随后 hello 重试）；连续 5 次才强制断开
+                this._unauthorizedHits = (this._unauthorizedHits || 0) + 1;
+                this.sendResponse(id, { error: 'Unauthorized' }, RpcProtocol.CONTENT_TYPES.JSON).catch(() => { });
+                if (this._unauthorizedHits >= 5) this.destroy();
                 return;
             }
+            this._unauthorizedHits = 0;
             this.handleRequest(id, content).catch(err => {
                 this._safeEmit('error', new RpcError(`handler failure: ${err.message}`, { code: 'EHANDLER' }));
             });
         } else if (type === RpcProtocol.TYPES.RESPONSE) {
             this.handleResponse(id, content);
         } else if (type === RpcProtocol.TYPES.EVENT) {
-            if (this.requiredToken && !this._authenticated) return;   // 未鉴权事件丢弃
-            this._safeEmit('event', { contentType, content });
+            if (this.requiredTokens.size > 0 && !this._authenticated) return;   // 未鉴权事件丢弃
+            this.emit('event', { contentType, content });
         } else if (type === RpcProtocol.TYPES.PING) {
             this.sendRaw(RpcProtocol.TYPES.PONG, RpcProtocol.CONTENT_TYPES.TEXT, id, '').catch(() => { });
         } else if (type === RpcProtocol.TYPES.PONG) {
@@ -224,9 +252,12 @@ export class RpcProtocol extends EventEmitter {
 
     // ========== 心跳（§8.1） ==========
     _heartbeatTick() {
-        if (this._destroyed) return;
+        if (this._destroyed || this.heartbeatDisabledReason) return;
+        // 能力协商：严格模式下，对端没声明 "ping" 就不做任何心跳探测/超时判定
+        if (this.heartbeatRequireCapability && !(this.peerCapabilities || []).includes('ping')) return;
         const silent = Date.now() - this._lastReceived;
-        if (this.heartbeatTimeoutMs > 0 && silent >= this.heartbeatTimeoutMs) {
+        const busy = this.heartbeatSkipWhilePending && this.pendingRequests.size > 0;
+        if (!busy && this.heartbeatTimeoutMs > 0 && silent >= this.heartbeatTimeoutMs) {
             const err = new RpcError(`heartbeat timeout: no data for ${silent}ms`, { code: 'EHEARTBEAT' });
             this._rejectAll(err);
             this._safeEmit('error', err);
@@ -238,21 +269,49 @@ export class RpcProtocol extends EventEmitter {
         }
     }
 
-    // ========== HELLO 握手（§8.2） ==========
+    /** v1.1.2：热轮换 token —— 新 token 立即生效，旧 token 可在宽限期内继续被接受 */
+    setRequiredTokens(tokens) {
+        this.requiredTokens = new Set(Array.isArray(tokens) ? tokens.filter(Boolean) : []);
+        this.requiredToken = [...this.requiredTokens][0] ?? null;
+    }
+
+    _disableHeartbeat(reason) {
+        if (this.heartbeatDisabledReason) return;
+        this.heartbeatDisabledReason = reason;
+        if (this._heartbeatTimer) { clearInterval(this._heartbeatTimer); this._heartbeatTimer = null; }
+        this.emit('heartbeatDisabled', reason);   // 信息类事件，无监听不报错
+    }
+
+    // ========== HELLO 握手（§8.2） + 能力协商（§8.4） ==========
     handleHello(id, content) {
         const version = content?.version;
         let ack, fail = false;
         if (version !== PROTOCOL_VERSION) {
             ack = { error: `unsupported protocol version: ${version}` }; fail = true;
-        } else if (this.requiredToken && content?.token !== this.requiredToken) {
+        } else if (this.requiredTokens.size > 0 && !this.requiredTokens.has(content?.token)) {
             ack = { error: 'unauthorized' }; fail = true;
         } else {
             this._authenticated = true;
-            ack = { version: PROTOCOL_VERSION, ok: true };
+            // 记录对端能力；对端声明了能力但不支持 PING → 本端不再做心跳，避免误杀
+            const caps = Array.isArray(content?.caps) ? content.caps : null;
+            this.peerCapabilities = caps;
+            if (caps && !caps.includes('ping')) {
+                this._disableHeartbeat(`peer ${content?.impl || 'unknown'} declares no "ping" capability`);
+            }
+            ack = {
+                version: PROTOCOL_VERSION, ok: true,
+                caps: this.capabilities, impl: this.implName,
+            };
         }
         this.sendRaw(RpcProtocol.TYPES.HELLO_ACK, RpcProtocol.CONTENT_TYPES.JSON, id, ack)
-            .then(() => { if (fail) this.destroy(); })
-            .catch(() => { if (fail) this.destroy(); });
+            .then(() => { if (fail) this._failAndClose(); })
+            .catch(() => { if (fail) this._failAndClose(); });
+    }
+
+    /** 握手失败：先让 ack 落到对端，再断开（直接 destroy 会把未刷出的帧丢掉，对端只见 ECLOSED） */
+    _failAndClose(delayMs = 300) {
+        const timer = setTimeout(() => this.destroy(), delayMs);
+        timer.unref?.();
     }
 
     handleHelloAck(id, content) {
@@ -265,14 +324,20 @@ export class RpcProtocol extends EventEmitter {
         } else if (!content || content.version !== PROTOCOL_VERSION) {
             pending.reject(new RpcError(`unsupported protocol version: ${content?.version}`, { code: 'EVERSION', remote: true }));
         } else {
+            // 记录服务端能力；服务端不支持 PING → 客户端主动停掉心跳
+            const caps = Array.isArray(content.caps) ? content.caps : null;
+            this.serverCapabilities = caps;
+            if (caps && !caps.includes('ping')) {
+                this._disableHeartbeat(`server ${content.impl || 'unknown'} declares no "ping" capability`);
+            }
             pending.resolve(content);
         }
     }
 
-    /** 显式握手：启用鉴权时调用方必须先 await hello() 再发业务请求 */
+    /** 显式握手：启用鉴权时调用方必须先 await hello() 再发业务请求；同时完成能力协商 */
     hello(timeoutMs = DEFAULT_TIMEOUT) {
         const id = uuidv4();
-        const payload = { version: PROTOCOL_VERSION };
+        const payload = { version: PROTOCOL_VERSION, caps: this.capabilities, impl: this.implName };
         if (this.authToken) payload.token = this.authToken;
         return this._sendAndTrack(id, RpcProtocol.TYPES.HELLO, RpcProtocol.CONTENT_TYPES.JSON, payload, timeoutMs, 'hello');
     }
@@ -351,10 +416,15 @@ export class RpcProtocol extends EventEmitter {
             { method, params, to }, timeoutMs, method);
     }
 
+    // 兼容旧调用：第三个参数若是数字，视为超时（毫秒），而不是业务参数
     sendRequestBinary(method, buffer, ...args) {
-        const timeoutMs = DEFAULT_TIMEOUT;
+        let timeoutMs = DEFAULT_TIMEOUT;
+        let extraArgs = args;
+        if (args.length === 1 && typeof args[0] === 'number') { timeoutMs = args[0]; extraArgs = []; }
+        else if (args.length === 2 && Array.isArray(args[0]) && typeof args[1] === 'number') { extraArgs = args[0]; timeoutMs = args[1]; }
+        const args2 = extraArgs;
         const id = uuidv4();
-        const binaryRequest = RpcProtocol.encodeBinaryRequest(method, args, buffer);
+        const binaryRequest = RpcProtocol.encodeBinaryRequest(method, args2, buffer);
         return this._sendAndTrack(id, RpcProtocol.TYPES.REQUEST, RpcProtocol.CONTENT_TYPES.BINARY,
             binaryRequest, timeoutMs, method);
     }
@@ -380,9 +450,12 @@ export class RpcProtocol extends EventEmitter {
         try { this.messageStream?.off('message', this._onMessage); } catch { }
         try { this.messageStream?.off('error', this._onStreamError); } catch { }
         try { this.messageStream?.off('syncComplete', this._onSync); } catch { }
+        try { this.messageStream?.off('close', this._onClose); } catch { }
         try { this.messageStream?.destroy(); } catch { }
         this.messageStream = null;
         this.handlers = null;
         this.removeAllListeners();
     }
 }
+//（注：内容由AI生成）
+

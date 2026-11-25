@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -64,14 +65,30 @@ type RpcProtocol struct {
 	// ---- v1.1: 心跳与 HELLO 握手（PROTOCOL.md §8.1/§8.2） ----
 	HeartbeatInterval time.Duration // <=0 关闭心跳
 	HeartbeatTimeout  time.Duration // 静默超时，EHEARTBEAT 断链；<=0 关闭
-	AuthToken         string        // 客户端 HELLO 携带的令牌
+	AuthToken         string        // 客户端 HELLO 携带的令牌（为空时回退环境变量 IPC_TOKEN）
 	RequiredToken     string        // 服务端要求的令牌；非空时未鉴权请求被拒绝
 	lastReceived      atomic.Int64  // 最后入站消息时刻（UnixMilli）
 	authenticated     atomic.Bool
 	hbStop            chan struct{}
 
+	// ---- v1.1.2: 能力协商（PROTOCOL.md §8.4） ----
+	Capabilities       []string // 本端声明的能力
+	ImplName           string   // 实现名，随 HELLO/HELLO_ACK 发送
+	PeerCapabilities   []string // 对端在 HELLO 中声明的能力（nil = 旧实现）
+	ServerCapabilities []string // 客户端收到 HELLO_ACK 里服务端声明的能力
+	heartbeatDisabled  atomic.Bool
+	heartbeatReason    atomic.Value // string
+	hbOnce             sync.Once
+
+	// ---- v1.1.3: 首个业务请求前自动握手（P2） ----
+	authSent atomic.Bool
+	authMu   sync.Mutex
+
 	closeOnce sync.Once
 }
+
+// DefaultCapabilities v1.1.2 默认能力集合。
+var DefaultCapabilities = []string{"ping", "binary", "event"}
 
 type rpcResult struct {
 	value any
@@ -85,6 +102,9 @@ func NewRpcProtocol(ms *MessageStream) *RpcProtocol {
 
 // NewRpcProtocolOptions 带心跳与鉴权配置的构造。
 func NewRpcProtocolOptions(ms *MessageStream, heartbeatInterval, heartbeatTimeout time.Duration, authToken, requiredToken string) *RpcProtocol {
+	if authToken == "" {
+		authToken = os.Getenv("IPC_TOKEN")
+	}
 	rpc := &RpcProtocol{
 		ms:                ms,
 		handlers:          make(map[string]Handler),
@@ -94,8 +114,11 @@ func NewRpcProtocolOptions(ms *MessageStream, heartbeatInterval, heartbeatTimeou
 		HeartbeatTimeout:  heartbeatTimeout,
 		AuthToken:         authToken,
 		RequiredToken:     requiredToken,
+		Capabilities:      append([]string(nil), DefaultCapabilities...),
+		ImplName:          "go",
 	}
-	rpc.authenticated.Store(requiredToken == "")
+	rpc.heartbeatReason.Store("")
+	rpc.authenticated.Store(requiredToken == "" && authToken == "")
 	rpc.lastReceived.Store(time.Now().UnixMilli())
 	ms.OnMessage = rpc.handleMessage
 	ms.OnError = rpc.handleStreamError
@@ -116,6 +139,9 @@ func (rpc *RpcProtocol) heartbeatLoop() {
 		case <-rpc.hbStop:
 			return
 		case <-ticker.C:
+			if rpc.heartbeatDisabled.Load() {
+				return
+			}
 			silent := time.Since(time.UnixMilli(rpc.lastReceived.Load()))
 			if rpc.HeartbeatTimeout > 0 && silent >= rpc.HeartbeatTimeout {
 				err := &RpcError{
@@ -162,6 +188,9 @@ func (rpc *RpcProtocol) SendRequestTimeout(method string, params any, timeout ti
 
 // SendRequestToTimeout 带 to 路由与显式超时的请求；超时返回 *RpcError{Code: "ETIMEDOUT"}，对齐 JS 修复版。
 func (rpc *RpcProtocol) SendRequestToTimeout(method string, params any, to string, timeout time.Duration) (any, error) {
+	if err := rpc.ensureAuth(); err != nil {
+		return nil, err
+	}
 	id := newUUID()
 	ch := make(chan rpcResult, 1)
 	rpc.pendingMu.Lock()
@@ -191,6 +220,9 @@ func (rpc *RpcProtocol) SendRequestBinary(method string, data []byte, args ...an
 
 // SendRequestBinaryTimeout 带显式超时的二进制请求；0 关闭超时。
 func (rpc *RpcProtocol) SendRequestBinaryTimeout(timeout time.Duration, method string, data []byte, args ...any) (any, error) {
+	if err := rpc.ensureAuth(); err != nil {
+		return nil, err
+	}
 	id := newUUID()
 	ch := make(chan rpcResult, 1)
 	rpc.pendingMu.Lock()
@@ -245,9 +277,11 @@ func (rpc *RpcProtocol) SendBinary(data []byte) error {
 // Close 销毁：拒绝所有 pending 并关闭流。
 func (rpc *RpcProtocol) Close() {
 	rpc.closeOnce.Do(func() {
-		if rpc.hbStop != nil {
-			close(rpc.hbStop)
-		}
+		rpc.hbOnce.Do(func() {
+			if rpc.hbStop != nil {
+				close(rpc.hbStop)
+			}
+		})
 		rpc.rejectAll(errors.New("RPC Protocol destroyed"))
 		rpc.ms.Close()
 	})
@@ -315,7 +349,7 @@ func (rpc *RpcProtocol) handleMessage(data []byte) {
 
 	switch msgType {
 	case TypeRequest:
-		if !rpc.authenticated.Load() {
+		if rpc.RequiredToken != "" && !rpc.authenticated.Load() {
 			rpc.sendErrorResponse(id, "Unauthorized")
 			rpc.Close()
 			return
@@ -332,7 +366,7 @@ func (rpc *RpcProtocol) handleMessage(data []byte) {
 			ch <- rpcResult{value: content}
 		}
 	case TypeEvent:
-		if !rpc.authenticated.Load() {
+		if rpc.RequiredToken != "" && !rpc.authenticated.Load() {
 			return // 未鉴权事件直接丢弃
 		}
 		if rpc.OnEvent != nil {
@@ -362,7 +396,18 @@ func (rpc *RpcProtocol) handleHello(id string, content any) {
 			ack["error"] = "Unauthorized"
 		} else {
 			rpc.authenticated.Store(true)
+			// v1.1.2：能力协商
+			rpc.PeerCapabilities = readCaps(m)
+			if rpc.PeerCapabilities != nil && !containsStr(rpc.PeerCapabilities, "ping") {
+				impl, _ := m["impl"].(string)
+				if impl == "" {
+					impl = "unknown"
+				}
+				rpc.disableHeartbeat("peer " + impl + " declares no 'ping' capability")
+			}
 			ack["ok"] = true
+			ack["caps"] = rpc.Capabilities
+			ack["impl"] = rpc.ImplName
 			ok = true
 		}
 	} else {
@@ -371,7 +416,8 @@ func (rpc *RpcProtocol) handleHello(id string, content any) {
 	body, _ := json.Marshal(ack)
 	_ = rpc.ms.Send(buildMessage(TypeHelloAck, ContentJSON, id, body))
 	if !ok {
-		rpc.Close() // 握手失败后服务端断链
+		// v1.1.2：先让 ack 刷到对端再断链（立即 Close 会丢掉未送达的 ack）
+		go func() { time.Sleep(300 * time.Millisecond); rpc.Close() }()
 	}
 }
 
@@ -393,7 +439,89 @@ func (rpc *RpcProtocol) handleHelloAck(id string, content any) {
 		ch <- rpcResult{err: &RpcError{Value: "Unsupported protocol version", Code: "EVERSION"}}
 		return
 	}
+	// v1.1.2：记录服务端能力；服务端不支持 PING 则本端停用心跳
+	rpc.ServerCapabilities = readCaps(m)
+	if rpc.ServerCapabilities != nil && !containsStr(rpc.ServerCapabilities, "ping") {
+		rpc.disableHeartbeat("server declares no 'ping' capability")
+	}
+	rpc.authenticated.Store(true)
 	ch <- rpcResult{value: content}
+}
+
+// ---- v1.1.3: 自动握手（P2） ----
+
+// ensureAuth 在首个业务请求前自动 HELLO。仅客户端（RequiredToken=="" 且持有 AuthToken）生效；
+// 并发调用由 authMu 串行化，只握手一次。
+func (rpc *RpcProtocol) ensureAuth() error {
+	if rpc.RequiredToken != "" || rpc.AuthToken == "" {
+		return nil
+	}
+	if rpc.authenticated.Load() || rpc.authSent.Load() {
+		return nil
+	}
+	rpc.authMu.Lock()
+	defer rpc.authMu.Unlock()
+	if rpc.authenticated.Load() || rpc.authSent.Load() {
+		return nil
+	}
+	if _, err := rpc.Hello(); err != nil {
+		return err
+	}
+	rpc.authSent.Store(true)
+	return nil
+}
+
+// AuthSent 是否已完成（或被跳过）自动握手。
+func (rpc *RpcProtocol) AuthSent() bool {
+	return rpc.authSent.Load() || rpc.authenticated.Load()
+}
+
+// ---- v1.1.2: 能力协商辅助 ----
+
+// HeartbeatDisabledReason 返回因能力协商停用心跳的原因（"" 表示心跳正常）。
+func (rpc *RpcProtocol) HeartbeatDisabledReason() string {
+	if s, _ := rpc.heartbeatReason.Load().(string); s != "" {
+		return s
+	}
+	return ""
+}
+
+func (rpc *RpcProtocol) disableHeartbeat(reason string) {
+	if rpc.heartbeatDisabled.Swap(true) {
+		return
+	}
+	rpc.heartbeatReason.Store(reason)
+	rpc.hbOnce.Do(func() {
+		if rpc.hbStop != nil {
+			close(rpc.hbStop)
+		}
+	})
+}
+
+func readCaps(m map[string]any) []string {
+	raw, ok := m["caps"].([]any)
+	if !ok {
+		if list, ok := m["caps"].([]string); ok {
+			return list
+		}
+		return nil
+	}
+	out := make([]string, 0, len(raw))
+	for _, it := range raw {
+		if s, ok := it.(string); ok {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+func containsStr(list []string, want string) bool {
+	for _, s := range list {
+		if s == want {
+			return true
+		}
+	}
+	return false
 }
 
 // Hello 发起 HELLO 握手（默认超时）；ACK error → EAUTH，版本不符 → EVERSION。
@@ -409,7 +537,8 @@ func (rpc *RpcProtocol) HelloTimeout(timeout time.Duration) (any, error) {
 	rpc.pending[id] = ch
 	rpc.pendingMu.Unlock()
 
-	payload := map[string]any{"version": float64(ProtocolVersion)}
+	payload := map[string]any{"version": float64(ProtocolVersion),
+		"caps": rpc.Capabilities, "impl": rpc.ImplName}
 	if rpc.AuthToken != "" {
 		payload["token"] = rpc.AuthToken
 	}

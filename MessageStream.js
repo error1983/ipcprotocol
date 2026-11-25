@@ -66,7 +66,7 @@ export class MessageStream extends EventEmitter {
 
         const onData = (d) => this._onData(d);
         const onEnd = () => this._failClosed('IPC stream ended');
-        const onClose = () => this._failClosed('IPC stream closed');
+        const onClose = () => this._failClosed('IPC stream closed', true);
         const onError = (err) => this._emitError(ipcError(`socket error: ${err?.message || err}`, 'ESOCKET'));
 
         this.socket.on('data', onData);
@@ -103,12 +103,22 @@ export class MessageStream extends EventEmitter {
         else console.error('[MessageStream] unhandled error:', err?.code || '', err?.message || err);
     }
 
-    _failClosed(reason) {
+    _failClosed(reason, closeEvent = false) {
         if (this._closed) return;
         this._closed = true;
+        this._notifyClose(closeEvent);
         if (this._syncDeferred) { try { this._syncDeferred.reject(ipcError(reason, 'ECLOSED')); } catch { } this._syncDeferred = null; }
         this._clearSyncTimer();
         this._emitError(ipcError(reason, 'ECLOSED'));
+    }
+
+    /** 广播一次 close 事件，保证上层能结算在途请求 */
+    _notifyClose(emitCloseEvent = true) {
+        if (this._closeNotified) return;
+        this._closeNotified = true;
+        if (emitCloseEvent && this.listenerCount('close') > 0) {
+            try { this.emit('close'); } catch { }
+        }
     }
 
     // ===== 接收缓冲工具 =====
@@ -420,6 +430,7 @@ export class MessageStream extends EventEmitter {
     destroy() {
         if (this._closed) return;
         this._closed = true;
+        this._notifyClose(true);
         if (this._syncDeferred) { try { this._syncDeferred.reject(ipcError('destroyed', 'ECLOSED')); } catch { } this._syncDeferred = null; }
         this._clearSyncTimer();
         this._clearBuffer();
@@ -430,3 +441,4 @@ export class MessageStream extends EventEmitter {
         this.removeAllListeners();
     }
 }
+//（注：内容由AI生成）
