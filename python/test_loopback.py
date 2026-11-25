@@ -31,6 +31,11 @@ async def main():
                                                          'head': list(data[:4])})  # 二进制请求
         rpc.register_method('push', lambda: asyncio.ensure_future(rpc.send_json({'push': 1})) or None)
 
+        async def slow():
+            await asyncio.sleep(0.5)
+            return 'late'
+        rpc.register_method('slow', slow)
+
     server = await serve_tcp(on_server, port=0)
     port = server.sockets[0].getsockname()[1]
 
@@ -105,7 +110,18 @@ async def main():
     check('crc error detected', len(srv_errors) >= 1)
     check('resync then rpc works', await client.send_request('add', [10, 20]) == 30)
 
-    # 11. destroy 后资源清理
+    # 11. RPC 超时：显式短超时触发 ETIMEDOUT，pending 清理后迟到响应不影响后续调用
+    try:
+        await client.send_request('slow', timeout=0.1)
+        check('rpc timeout ETIMEDOUT', False)
+    except RpcError as e:
+        check('rpc timeout ETIMEDOUT', e.code == 'ETIMEDOUT' and 'slow' in str(e.error))
+    check('after timeout rpc works', await client.send_request('add', [1, 2]) == 3)
+    await asyncio.sleep(0.6)  # 等 slow 的迟到响应到达（应被静默丢弃）
+    check('late response ignored', await client.send_request('add', [5, 6]) == 11)
+    check('default timeout is 15s', client.default_timeout == 15.0)
+
+    # 12. destroy 后资源清理
     await client.destroy()
     for s in server_streams:
         await s.destroy()

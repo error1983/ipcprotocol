@@ -56,6 +56,7 @@ public class LoopbackTest {
                     result.put("head", head);
                     return result;
                 });
+                rpc.registerMethod("slow", a -> { Thread.sleep(500); return "late"; });
                 serverReady.countDown();
             } catch (Exception e) {
                 e.printStackTrace();
@@ -157,7 +158,20 @@ public class LoopbackTest {
         check("crc error detected", !srvErrors.isEmpty());
         check("resync then rpc works", ((Number) client.sendRequest("add", Arrays.asList(10, 20)).get(3, TimeUnit.SECONDS)).longValue() == 30);
 
-        // 11. destroy 后资源清理
+        // 11. RPC 超时：显式短超时触发 ETIMEDOUT，pending 清理后迟到响应不影响后续调用
+        try {
+            client.sendRequest("slow", null, null, 100).get(3, TimeUnit.SECONDS);
+            check("rpc timeout ETIMEDOUT", false);
+        } catch (java.util.concurrent.ExecutionException e) {
+            RpcProtocol.RpcException re = (RpcProtocol.RpcException) e.getCause();
+            check("rpc timeout ETIMEDOUT", "ETIMEDOUT".equals(re.getCode()) && String.valueOf(re.getError()).contains("slow"));
+        }
+        check("after timeout rpc works", ((Number) client.sendRequest("add", Arrays.asList(1, 2)).get(3, TimeUnit.SECONDS)).longValue() == 3);
+        Thread.sleep(600); // 等 slow 的迟到响应到达（应被静默丢弃）
+        check("late response ignored", ((Number) client.sendRequest("add", Arrays.asList(5, 6)).get(3, TimeUnit.SECONDS)).longValue() == 11);
+        check("default timeout is 15s", client.getDefaultTimeoutMs() == 15000);
+
+        // 12. destroy 后资源清理
         client.close();
         serverSocket.close();
         System.out.println("\nALL " + passed + " JAVA TESTS PASSED");

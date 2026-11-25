@@ -25,12 +25,16 @@ from message_stream import MessageStream
 TYPES = {'REQUEST': 0, 'RESPONSE': 1, 'EVENT': 2}
 CONTENT_TYPES = {'TEXT': 0, 'JSON': 1, 'BINARY': 2}
 
+# 默认 RPC 超时（秒），对齐 JS 修复版 DEFAULT_TIMEOUT=15000ms；0 表示关闭
+DEFAULT_TIMEOUT = 15.0
+
 
 class RpcError(Exception):
-    """对端返回的错误响应，error 属性携带原始 error 值。"""
+    """对端返回的错误响应，error 属性携带原始 error 值；code 为错误码（如 ETIMEDOUT/EREMOTE）。"""
 
-    def __init__(self, error):
+    def __init__(self, error, code=None):
         self.error = error
+        self.code = code
         super().__init__(str(error))
 
 
@@ -103,10 +107,11 @@ class RpcProtocol:
     TYPES = TYPES
     CONTENT_TYPES = CONTENT_TYPES
 
-    def __init__(self, message_stream: MessageStream):
+    def __init__(self, message_stream: MessageStream, default_timeout: float = DEFAULT_TIMEOUT):
         if message_stream is None:
             raise ValueError('messageStream is undefined')
         self.message_stream = message_stream
+        self.default_timeout = default_timeout
         self.handlers = {}
         self.pending_requests = {}
         self._listeners = {}
@@ -215,7 +220,7 @@ class RpcProtocol:
         pending = self.pending_requests.pop(msg_id, None)
         if pending is not None and not pending.done():
             if isinstance(response, dict) and response.get('error'):
-                pending.set_exception(RpcError(response['error']))
+                pending.set_exception(RpcError(response['error'], code='EREMOTE'))
             else:
                 pending.set_result(response)
 
@@ -226,8 +231,21 @@ class RpcProtocol:
         message = serialize(msg_type, content_type, msg_id, data)
         await self.message_stream.send(message)
 
-    async def send_request(self, method: str, params=None, to=None):
-        """发送 JSON 请求并等待响应。params 为列表时展开为多参数。"""
+    async def _wait_pending(self, msg_id: str, future, method: str, timeout):
+        """等待响应；超时移除 pending 并抛 RpcError(code='ETIMEDOUT')，对齐 JS 修复版。"""
+        effective = self.default_timeout if timeout is None else timeout
+        try:
+            if effective and effective > 0:
+                return await asyncio.wait_for(future, effective)
+            return await future
+        except asyncio.TimeoutError:
+            self.pending_requests.pop(msg_id, None)
+            raise RpcError(f'RPC timeout after {int(effective * 1000)}ms: {method}',
+                           code='ETIMEDOUT') from None
+
+    async def send_request(self, method: str, params=None, to=None, timeout=None):
+        """发送 JSON 请求并等待响应。params 为列表时展开为多参数。
+        timeout 为秒；None 用 default_timeout，0 关闭超时。"""
         msg_id = str(uuid.uuid4())
         future = asyncio.get_event_loop().create_future()
         self.pending_requests[msg_id] = future
@@ -240,9 +258,9 @@ class RpcProtocol:
             self.pending_requests.pop(msg_id, None)
             if not future.done():
                 future.set_exception(err)
-        return await future
+        return await self._wait_pending(msg_id, future, method, timeout)
 
-    async def send_request_binary(self, method: str, buffer: bytes, *args):
+    async def send_request_binary(self, method: str, buffer: bytes, *args, timeout=None):
         """发送二进制请求并等待响应。服务端 handler 收到 [buffer, *args]。"""
         msg_id = str(uuid.uuid4())
         future = asyncio.get_event_loop().create_future()
@@ -254,7 +272,7 @@ class RpcProtocol:
             self.pending_requests.pop(msg_id, None)
             if not future.done():
                 future.set_exception(err)
-        return await future
+        return await self._wait_pending(msg_id, future, method, timeout)
 
     async def send_response(self, msg_id: str, response, content_type: int = CONTENT_TYPES['JSON']):
         await self.send_raw(TYPES['RESPONSE'], content_type, msg_id, response)

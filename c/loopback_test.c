@@ -91,6 +91,11 @@ static JsonValue* h_push(void* u, JsonValue** a, size_t n, char** err) {
     rpc_send_binary(rpc, b, sizeof(b));
     return json_str("sent");
 }
+static JsonValue* h_slow(void* u, JsonValue** a, size_t n, char** err) {
+    (void)u; (void)a; (void)n; (void)err;
+    Sleep(500);
+    return json_str("late");
+}
 
 static void silent_error(void* u, const char* msg) { (void)u; (void)msg; }
 
@@ -114,6 +119,7 @@ static void* server_thread(void* arg) {
     rpc_register(s->rpc, "fail", h_fail, NULL);
     rpc_register(s->rpc, "upload", h_upload, NULL);
     rpc_register(s->rpc, "pushEvents", h_push, s->rpc);
+    rpc_register(s->rpc, "slow", h_slow, NULL);
     s->ready = 1;
     return NULL;
 }
@@ -348,6 +354,76 @@ int main(void) {
         json_arr_push(p, json_num(20));
         RpcResult r = rpc_send_request(rpc, "add", p, NULL);
         check("after resync", r.value && r.value->u.number == 30);
+        rpc_result_free(&r);
+        json_free(p);
+        rpc_destroy(rpc);
+        tcp_conn_free(conn);
+        stop_server(s);
+    }
+    /* 8. RPC 超时：pthread_cond_timedwait 触发 ETIMEDOUT，pending 清理后迟到响应不影响后续调用 */
+    {
+        TestServer* s = start_server();
+        TcpConn* conn;
+        RpcProtocol* rpc = dial(s, &conn);
+        RpcResult r = rpc_send_request_timeout(rpc, "slow", NULL, NULL, 100);
+        check("rpc timeout ETIMEDOUT", !r.value && r.error && r.code &&
+                                      strcmp(r.code, "ETIMEDOUT") == 0 && strstr(r.error->u.str, "slow"));
+        rpc_result_free(&r);
+        JsonValue* p = json_arr();
+        json_arr_push(p, json_num(1));
+        json_arr_push(p, json_num(2));
+        r = rpc_send_request(rpc, "add", p, NULL);
+        check("after timeout", r.value && r.value->u.number == 3);
+        rpc_result_free(&r);
+        json_free(p);
+        Sleep(600); /* 等 slow 的迟到响应到达（应被静默丢弃） */
+        p = json_arr();
+        json_arr_push(p, json_num(5));
+        json_arr_push(p, json_num(6));
+        r = rpc_send_request(rpc, "add", p, NULL);
+        check("late response ignored", r.value && r.value->u.number == 11);
+        rpc_result_free(&r);
+        json_free(p);
+        rpc_destroy(rpc);
+        tcp_conn_free(conn);
+        stop_server(s);
+    }
+    /* 9. 深嵌套 JSON：解析器 64 层上限，超限走 Invalid request payload 路径不崩溃 */
+    {
+        /* 单元：200 层嵌套 parse 应返回 NULL；60 层正常 */
+        char deep[401];
+        memset(deep, '[', 200);
+        memset(deep + 200, ']', 200);
+        deep[400] = '\0';
+        check("parse depth limit", json_parse(deep) == NULL);
+        char ok60[121];
+        memset(ok60, '[', 60);
+        memset(ok60 + 60, ']', 60);
+        ok60[120] = '\0';
+        JsonValue* v60 = json_parse(ok60);
+        check("parse within limit", v60 != NULL);
+        json_free(v60);
+
+        /* 端到端：客户端 dump 200 层参数发出，服务端解析失败回错误响应，后续通信正常 */
+        TestServer* s = start_server();
+        TcpConn* conn;
+        RpcProtocol* rpc = dial(s, &conn);
+        JsonValue* nested = json_num(1);
+        for (int i = 0; i < 200; i++) {
+            JsonValue* w = json_arr();
+            json_arr_push(w, nested);
+            nested = w;
+        }
+        RpcResult r = rpc_send_request(rpc, "echo", nested, NULL);
+        check("deep frame error response", r.remote && r.error &&
+                                           strstr(r.error->u.str, "Invalid request payload"));
+        rpc_result_free(&r);
+        json_free(nested);
+        JsonValue* p = json_arr();
+        json_arr_push(p, json_num(7));
+        json_arr_push(p, json_num(8));
+        r = rpc_send_request(rpc, "add", p, NULL);
+        check("after deep frame", r.value && r.value->u.number == 15);
         rpc_result_free(&r);
         json_free(p);
         rpc_destroy(rpc);

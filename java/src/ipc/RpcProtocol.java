@@ -15,6 +15,9 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
 
 /**
  * RpcProtocol.js 的 Java 移植版（线格式完全兼容，Java 11+，零依赖）。
@@ -39,14 +42,18 @@ public class RpcProtocol implements Closeable {
     public interface EventListener { void onEvent(int contentType, Object content); }
     public interface ErrorListener { void onError(Exception err); }
 
-    /** 对端返回的错误响应，getError() 携带原始 error 值。 */
+    /** 对端返回的错误响应，getError() 携带原始 error 值；getCode() 为错误码（如 ETIMEDOUT/EREMOTE）。 */
     public static class RpcException extends RuntimeException {
         private final Object error;
-        public RpcException(Object error) {
+        private final String code;
+        public RpcException(Object error) { this(error, null); }
+        public RpcException(Object error, String code) {
             super(String.valueOf(error));
             this.error = error;
+            this.code = code;
         }
         public Object getError() { return error; }
+        public String getCode() { return code; }
     }
 
     private MessageStream messageStream;
@@ -59,6 +66,13 @@ public class RpcProtocol implements Closeable {
         t.setDaemon(true);
         return t;
     });
+    private final ScheduledExecutorService timeoutScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
+        Thread t = new Thread(r, "RpcProtocol-timeout");
+        t.setDaemon(true);
+        return t;
+    });
+    /** 默认 RPC 超时（毫秒），对齐 JS 修复版 15s；0 表示关闭。 */
+    private volatile long defaultTimeoutMs = 15000;
     private volatile boolean closed = false;
 
     public RpcProtocol(MessageStream messageStream) {
@@ -77,6 +91,9 @@ public class RpcProtocol implements Closeable {
 
     public void onEvent(EventListener listener) { synchronized (eventListeners) { eventListeners.add(listener); } }
     public void addErrorListener(ErrorListener listener) { synchronized (errorListeners) { errorListeners.add(listener); } }
+
+    public long getDefaultTimeoutMs() { return defaultTimeoutMs; }
+    public void setDefaultTimeoutMs(long ms) { defaultTimeoutMs = ms; }
 
     private void emitEvent(int contentType, Object content) {
         List<EventListener> copy;
@@ -284,7 +301,7 @@ public class RpcProtocol implements Closeable {
         CompletableFuture<Object> pending = pendingRequests.remove(id);
         if (pending == null) return;
         if (response instanceof Map && isTruthy(((Map<String, Object>) response).get("error"))) {
-            pending.completeExceptionally(new RpcException(((Map<String, Object>) response).get("error")));
+            pending.completeExceptionally(new RpcException(((Map<String, Object>) response).get("error"), "EREMOTE"));
         } else {
             pending.complete(response);
         }
@@ -311,9 +328,15 @@ public class RpcProtocol implements Closeable {
     }
 
     public CompletableFuture<Object> sendRequest(String method, Object params, String to) {
+        return sendRequest(method, params, to, defaultTimeoutMs);
+    }
+
+    /** 带显式超时（毫秒）的请求；0 关闭超时。超时以 RpcException(code="ETIMEDOUT") 完成，对齐 JS 修复版。 */
+    public CompletableFuture<Object> sendRequest(String method, Object params, String to, long timeoutMs) {
         String id = UUID.randomUUID().toString();
         CompletableFuture<Object> future = new CompletableFuture<>();
         pendingRequests.put(id, future);
+        armTimeout(id, future, method, timeoutMs);
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("method", method);
         body.put("params", params);
@@ -327,11 +350,17 @@ public class RpcProtocol implements Closeable {
         return future;
     }
 
-    /** 发送二进制请求并等待响应。服务端 handler 收到 [data, ...args]。 */
+    /** 发送二进制请求并等待响应（默认超时）。服务端 handler 收到 [data, ...args]。 */
     public CompletableFuture<Object> sendRequestBinary(String method, byte[] data, Object... args) {
+        return sendRequestBinaryWithTimeout(defaultTimeoutMs, method, data, args);
+    }
+
+    /** 带显式超时（毫秒）的二进制请求；0 关闭超时。 */
+    public CompletableFuture<Object> sendRequestBinaryWithTimeout(long timeoutMs, String method, byte[] data, Object... args) {
         String id = UUID.randomUUID().toString();
         CompletableFuture<Object> future = new CompletableFuture<>();
         pendingRequests.put(id, future);
+        armTimeout(id, future, method, timeoutMs);
         byte[] binaryRequest = encodeBinaryRequest(method, Arrays.asList(args), data);
         try {
             sendRaw(TYPE_REQUEST, CONTENT_BINARY, id, binaryRequest);
@@ -340,6 +369,18 @@ public class RpcProtocol implements Closeable {
             future.completeExceptionally(err);
         }
         return future;
+    }
+
+    /** 超时触发：先移除 pending 再拒绝，避免迟到响应写入已废弃的 future。 */
+    private void armTimeout(String id, CompletableFuture<Object> future, String method, long timeoutMs) {
+        if (timeoutMs <= 0) return;
+        ScheduledFuture<?> timer = timeoutScheduler.schedule(() -> {
+            if (pendingRequests.remove(id) != null) {
+                future.completeExceptionally(new RpcException(
+                        "RPC timeout after " + timeoutMs + "ms: " + method, "ETIMEDOUT"));
+            }
+        }, timeoutMs, TimeUnit.MILLISECONDS);
+        future.whenComplete((r, e) -> timer.cancel(false));
     }
 
     public void sendResponse(String id, Object response, int contentType) {
@@ -387,6 +428,7 @@ public class RpcProtocol implements Closeable {
         synchronized (eventListeners) { eventListeners.clear(); }
         synchronized (errorListeners) { errorListeners.clear(); }
         executor.shutdownNow();
+        timeoutScheduler.shutdownNow();
         System.out.println("[RpcProtocol] Destroyed");
     }
 

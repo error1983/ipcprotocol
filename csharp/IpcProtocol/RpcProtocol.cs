@@ -17,11 +17,16 @@ namespace IpcProtocol;
 public enum MessageType : byte { Request = 0, Response = 1, Event = 2 }
 public enum ContentType : byte { Text = 0, Json = 1, Binary = 2 }
 
-/// <summary>对端返回的错误响应，Error 属性携带原始 error 值（string 或 JsonElement）。</summary>
+/// <summary>对端返回的错误响应，Error 属性携带原始 error 值（string 或 JsonElement）；Code 为错误码（如 ETIMEDOUT/EREMOTE）。</summary>
 public sealed class RpcException : Exception
 {
     public object? Error { get; }
-    public RpcException(object? error) : base(error?.ToString() ?? "null") => Error = error;
+    public string? Code { get; }
+    public RpcException(object? error, string? code = null) : base(error?.ToString() ?? "null")
+    {
+        Error = error;
+        Code = code;
+    }
 }
 
 public sealed class RpcEvent
@@ -50,6 +55,9 @@ public sealed class RpcProtocol : IDisposable
     private readonly ConcurrentDictionary<string, Func<object?[], Task<object?>>> _handlers = new();
     private readonly ConcurrentDictionary<string, TaskCompletionSource<object?>> _pendingRequests = new();
     private volatile bool _disposed;
+
+    /// <summary>默认 RPC 超时，对齐 JS 修复版 15s；TimeSpan.Zero 表示关闭。</summary>
+    public TimeSpan DefaultTimeout { get; set; } = TimeSpan.FromSeconds(15);
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -266,7 +274,7 @@ public sealed class RpcProtocol : IDisposable
             && json.TryGetProperty("error", out var error) && IsTruthy(error))
         {
             object? errorValue = error.ValueKind == JsonValueKind.String ? error.GetString() : (object?)error;
-            pending.TrySetException(new RpcException(errorValue));
+            pending.TrySetException(new RpcException(errorValue, "EREMOTE"));
         }
         else
         {
@@ -301,8 +309,26 @@ public sealed class RpcProtocol : IDisposable
         return stream.SendAsync(Serialize(type, contentType, id, data));
     }
 
-    /// <summary>发送 JSON 请求并等待响应。返回 string(TEXT)/byte[](BINARY)/JsonElement(JSON)。</summary>
-    public async Task<object?> SendRequestAsync(string method, object? parameters = null, string? to = null)
+    /// <summary>等待响应；超时移除 pending 并抛 RpcException(Code="ETIMEDOUT")，对齐 JS 修复版。</summary>
+    private async Task<object?> WaitPendingAsync(string id, TaskCompletionSource<object?> tcs, string method, TimeSpan? timeout)
+    {
+        var effective = timeout ?? DefaultTimeout;
+        try
+        {
+            return effective > TimeSpan.Zero
+                ? await tcs.Task.WaitAsync(effective).ConfigureAwait(false)
+                : await tcs.Task.ConfigureAwait(false);
+        }
+        catch (TimeoutException)
+        {
+            _pendingRequests.TryRemove(id, out _);
+            throw new RpcException($"RPC timeout after {(long)effective.TotalMilliseconds}ms: {method}", "ETIMEDOUT");
+        }
+    }
+
+    /// <summary>发送 JSON 请求并等待响应。返回 string(TEXT)/byte[](BINARY)/JsonElement(JSON)。
+    /// timeout 为 null 用 DefaultTimeout，TimeSpan.Zero 关闭超时。</summary>
+    public async Task<object?> SendRequestAsync(string method, object? parameters = null, string? to = null, TimeSpan? timeout = null)
     {
         var id = Guid.NewGuid().ToString();
         var tcs = new TaskCompletionSource<object?>(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -319,18 +345,22 @@ public sealed class RpcProtocol : IDisposable
             _pendingRequests.TryRemove(id, out _);
             tcs.TrySetException(err);
         }
-        return await tcs.Task.ConfigureAwait(false);
+        return await WaitPendingAsync(id, tcs, method, timeout).ConfigureAwait(false);
     }
 
     /// <summary>发送 JSON 请求并把 JSON 响应反序列化为 T。</summary>
-    public async Task<T?> SendRequestAsync<T>(string method, object? parameters = null, string? to = null)
+    public async Task<T?> SendRequestAsync<T>(string method, object? parameters = null, string? to = null, TimeSpan? timeout = null)
     {
-        var result = await SendRequestAsync(method, parameters, to).ConfigureAwait(false);
+        var result = await SendRequestAsync(method, parameters, to, timeout).ConfigureAwait(false);
         return Convert<T>(result);
     }
 
-    /// <summary>发送二进制请求并等待响应。服务端 handler 收到 [data, ...args]。</summary>
-    public async Task<object?> SendRequestBinaryAsync(string method, byte[] data, params object?[] args)
+    /// <summary>发送二进制请求并等待响应（默认超时）。服务端 handler 收到 [data, ...args]。</summary>
+    public Task<object?> SendRequestBinaryAsync(string method, byte[] data, params object?[] args)
+        => SendRequestBinaryWithTimeoutAsync(DefaultTimeout, method, data, args);
+
+    /// <summary>发送二进制请求并等待响应；TimeSpan.Zero 关闭超时。</summary>
+    public async Task<object?> SendRequestBinaryWithTimeoutAsync(TimeSpan timeout, string method, byte[] data, params object?[] args)
     {
         var id = Guid.NewGuid().ToString();
         var tcs = new TaskCompletionSource<object?>(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -345,7 +375,7 @@ public sealed class RpcProtocol : IDisposable
             _pendingRequests.TryRemove(id, out _);
             tcs.TrySetException(err);
         }
-        return await tcs.Task.ConfigureAwait(false);
+        return await WaitPendingAsync(id, tcs, method, timeout).ConfigureAwait(false);
     }
 
     public Task SendResponseAsync(string id, object? response, byte contentType = ContentTypes.Json)

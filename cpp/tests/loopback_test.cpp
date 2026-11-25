@@ -85,6 +85,10 @@ struct TestServer {
             rpc->sendBinary({9, 8, 7});
             return Json::ofStr("sent");
         });
+        rpc->registerMethod("slow", [](const std::vector<Json>&) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            return Json::ofStr("late");
+        });
     }
 };
 
@@ -214,6 +218,54 @@ int main() {
         check("syncComplete", synced);
         Json v = rpc->sendRequest("add", Json::ofArr({Json::ofNum(10), Json::ofNum(20)}));
         check("after resync", v.asNum() == 30);
+        rpc->close();
+    }
+    // 8. RPC 超时：显式短超时触发 ETIMEDOUT，pending 清理后迟到响应不影响后续调用
+    {
+        TestServer server(std::make_shared<std::promise<void>>());
+        std::shared_ptr<TcpStream> conn;
+        auto rpc = dial(server, conn);
+        check("default timeout 15s", rpc->defaultTimeoutMs() == 15000);
+        bool ok = false;
+        try {
+            rpc->sendRequest("slow", Json::null(), "", 100);
+        } catch (const RpcException& e) {
+            ok = e.code == "ETIMEDOUT" && std::string(e.what()).find("slow") != std::string::npos;
+        }
+        check("rpc timeout ETIMEDOUT", ok);
+        check("after timeout", rpc->sendRequest("add", Json::ofArr({Json::ofNum(1), Json::ofNum(2)})).asNum() == 3);
+        std::this_thread::sleep_for(std::chrono::milliseconds(600)); // 迟到响应应被静默丢弃
+        check("late response ignored", rpc->sendRequest("add", Json::ofArr({Json::ofNum(5), Json::ofNum(6)})).asNum() == 11);
+        rpc->close();
+    }
+    // 9. 深嵌套 JSON：解析器 64 层上限，超限走 Invalid request payload 路径不崩溃
+    {
+        // 单元：200 层嵌套直接 parse 应抛异常；64 层以内正常
+        std::string deep(200, '[');
+        deep.append(200, ']');
+        bool threw = false;
+        try { Json::parse(deep); } catch (const std::exception&) { threw = true; }
+        check("parse depth limit", threw);
+        std::string ok64(60, '[');
+        ok64.append(60, ']');
+        bool parsed = true;
+        try { Json::parse(ok64); } catch (const std::exception&) { parsed = false; }
+        check("parse within limit", parsed);
+
+        // 端到端：客户端 dump 200 层参数发出，服务端解析失败回错误响应，后续通信正常
+        TestServer server(std::make_shared<std::promise<void>>());
+        std::shared_ptr<TcpStream> conn;
+        auto rpc = dial(server, conn);
+        Json nested = Json::ofNum(1);
+        for (int i = 0; i < 200; i++) nested = Json::ofArr({nested});
+        bool gotError = false;
+        try {
+            rpc->sendRequest("echo", nested);
+        } catch (const RpcException& e) {
+            gotError = e.remote && e.error.asStr().find("Invalid request payload") != std::string::npos;
+        }
+        check("deep frame error response", gotError);
+        check("after deep frame", rpc->sendRequest("add", Json::ofArr({Json::ofNum(7), Json::ofNum(8)})).asNum() == 15);
         rpc->close();
     }
 

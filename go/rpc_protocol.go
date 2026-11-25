@@ -11,6 +11,7 @@ import (
 	"math"
 	"strings"
 	"sync"
+	"time"
 )
 
 // 消息类型与载荷类型（与 JS 版一致）。
@@ -27,8 +28,12 @@ const (
 // Handler 服务端方法处理器；args 为展开后的参数，返回值决定响应类型。
 type Handler func(args []any) (any, error)
 
-// RpcError 对端返回的错误响应，Value 携带原始 error 值（与 JS reject(response.error) 对齐）。
-type RpcError struct{ Value any }
+// RpcError 对端返回的错误响应，Value 携带原始 error 值（与 JS reject(response.error) 对齐）；
+// Code 为错误码（如 ETIMEDOUT/EREMOTE）。
+type RpcError struct {
+	Value any
+	Code  string
+}
 
 func (e *RpcError) Error() string { return fmt.Sprintf("rpc error: %v", e.Value) }
 
@@ -45,6 +50,9 @@ type RpcProtocol struct {
 	OnEvent func(contentType int, content any)
 	OnError func(err error)
 
+	// DefaultTimeout 默认 RPC 超时，对齐 JS 修复版 15s；0 表示关闭。可在构造后修改。
+	DefaultTimeout time.Duration
+
 	closeOnce sync.Once
 }
 
@@ -56,9 +64,10 @@ type rpcResult struct {
 // NewRpcProtocol 包装消息流；先注册回调再启动读循环，避免早到消息丢失。
 func NewRpcProtocol(ms *MessageStream) *RpcProtocol {
 	rpc := &RpcProtocol{
-		ms:       ms,
-		handlers: make(map[string]Handler),
-		pending:  make(map[string]chan rpcResult),
+		ms:             ms,
+		handlers:       make(map[string]Handler),
+		pending:        make(map[string]chan rpcResult),
+		DefaultTimeout: 15 * time.Second,
 	}
 	ms.OnMessage = rpc.handleMessage
 	ms.OnError = rpc.handleStreamError
@@ -80,8 +89,18 @@ func (rpc *RpcProtocol) SendRequest(method string, params any) (any, error) {
 	return rpc.SendRequestTo(method, params, "")
 }
 
-// SendRequestTo 带可选 to 路由字段的请求。
+// SendRequestTo 带可选 to 路由字段的请求（默认超时）。
 func (rpc *RpcProtocol) SendRequestTo(method string, params any, to string) (any, error) {
+	return rpc.SendRequestToTimeout(method, params, to, rpc.DefaultTimeout)
+}
+
+// SendRequestTimeout 带显式超时的请求；0 关闭超时。
+func (rpc *RpcProtocol) SendRequestTimeout(method string, params any, timeout time.Duration) (any, error) {
+	return rpc.SendRequestToTimeout(method, params, "", timeout)
+}
+
+// SendRequestToTimeout 带 to 路由与显式超时的请求；超时返回 *RpcError{Code: "ETIMEDOUT"}，对齐 JS 修复版。
+func (rpc *RpcProtocol) SendRequestToTimeout(method string, params any, to string, timeout time.Duration) (any, error) {
 	id := newUUID()
 	ch := make(chan rpcResult, 1)
 	rpc.pendingMu.Lock()
@@ -101,12 +120,16 @@ func (rpc *RpcProtocol) SendRequestTo(method string, params any, to string) (any
 		rpc.removePending(id)
 		return nil, err
 	}
-	res := <-ch
-	return res.value, res.err
+	return rpc.waitResult(id, ch, method, timeout)
 }
 
-// SendRequestBinary 发送二进制请求：handler 实参为 [data, ...args]。
+// SendRequestBinary 发送二进制请求（默认超时）：handler 实参为 [data, ...args]。
 func (rpc *RpcProtocol) SendRequestBinary(method string, data []byte, args ...any) (any, error) {
+	return rpc.SendRequestBinaryTimeout(rpc.DefaultTimeout, method, data, args...)
+}
+
+// SendRequestBinaryTimeout 带显式超时的二进制请求；0 关闭超时。
+func (rpc *RpcProtocol) SendRequestBinaryTimeout(timeout time.Duration, method string, data []byte, args ...any) (any, error) {
 	id := newUUID()
 	ch := make(chan rpcResult, 1)
 	rpc.pendingMu.Lock()
@@ -118,8 +141,27 @@ func (rpc *RpcProtocol) SendRequestBinary(method string, data []byte, args ...an
 		rpc.removePending(id)
 		return nil, err
 	}
-	res := <-ch
-	return res.value, res.err
+	return rpc.waitResult(id, ch, method, timeout)
+}
+
+// waitResult 等待响应；超时先移除 pending 再返回 ETIMEDOUT，避免迟到响应写入已废弃的 channel。
+func (rpc *RpcProtocol) waitResult(id string, ch chan rpcResult, method string, timeout time.Duration) (any, error) {
+	if timeout <= 0 {
+		res := <-ch
+		return res.value, res.err
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case res := <-ch:
+		return res.value, res.err
+	case <-timer.C:
+		rpc.removePending(id)
+		return nil, &RpcError{
+			Value: fmt.Sprintf("RPC timeout after %dms: %s", timeout.Milliseconds(), method),
+			Code:  "ETIMEDOUT",
+		}
+	}
 }
 
 // SendText / SendJSON / SendBinary 发送单向事件。
@@ -204,7 +246,7 @@ func (rpc *RpcProtocol) handleMessage(data []byte) {
 		if ch := rpc.takePending(id); ch != nil {
 			if m, ok := content.(map[string]any); ok {
 				if ev, exists := m["error"]; exists && isTruthy(ev) {
-					ch <- rpcResult{err: &RpcError{Value: ev}}
+					ch <- rpcResult{err: &RpcError{Value: ev, Code: "EREMOTE"}}
 					return
 				}
 			}

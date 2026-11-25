@@ -62,6 +62,10 @@ func startTestServer(t *testing.T) *testServer {
 			_ = rpc.SendBinary([]byte{9, 8, 7})
 			return "sent", nil
 		})
+		rpc.RegisterMethod("slow", func(a []any) (any, error) {
+			time.Sleep(500 * time.Millisecond)
+			return "late", nil
+		})
 		close(ts.ready)
 	}()
 	// 等待服务端就绪（连接建立后才注册完成，先 dial 再等 ready）
@@ -272,5 +276,31 @@ func TestCRCRecovery(t *testing.T) {
 	v, err := rpc.SendRequest("add", []any{10, 20})
 	if err != nil || v.(float64) != 30 {
 		t.Fatalf("after resync: %v %v", v, err)
+	}
+}
+
+func TestRPCTimeout(t *testing.T) {
+	ts := startTestServer(t)
+	defer ts.close()
+	rpc, _ := dialTest(t, ts)
+	defer rpc.Close()
+
+	if rpc.DefaultTimeout != 15*time.Second {
+		t.Fatalf("default timeout = %v", rpc.DefaultTimeout)
+	}
+	// 显式短超时触发 ETIMEDOUT
+	_, err := rpc.SendRequestTimeout("slow", nil, 100*time.Millisecond)
+	re, ok := err.(*RpcError)
+	if !ok || re.Code != "ETIMEDOUT" {
+		t.Fatalf("slow err = %v", err)
+	}
+	// pending 已清理，后续调用正常
+	if v, err := rpc.SendRequest("add", []any{1, 2}); err != nil || v.(float64) != 3 {
+		t.Fatalf("after timeout: %v %v", v, err)
+	}
+	// 等 slow 的迟到响应到达（应被静默丢弃）
+	time.Sleep(600 * time.Millisecond)
+	if v, err := rpc.SendRequest("add", []any{5, 6}); err != nil || v.(float64) != 11 {
+		t.Fatalf("late response: %v %v", v, err)
 	}
 }

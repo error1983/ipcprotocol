@@ -1,6 +1,8 @@
 // RpcProtocol 消息层：请求/响应/事件，与 RpcProtocol.js 线格式兼容。
 #pragma once
 
+#include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstring>
 #include <functional>
@@ -27,16 +29,18 @@ constexpr uint8_t CONTENT_TEXT = 0;
 constexpr uint8_t CONTENT_JSON = 1;
 constexpr uint8_t CONTENT_BINARY = 2;
 
-// RPC 错误：remote=true 时 error 携带对端原始 error 值（对齐 JS reject(response.error)）。
+// RPC 错误：remote=true 时 error 携带对端原始 error 值（对齐 JS reject(response.error)）；
+// code 为错误码（如 ETIMEDOUT/EREMOTE）。
 class RpcException : public std::runtime_error {
 public:
     Json error;
     bool remote;
+    std::string code;
 
-    explicit RpcException(const std::string& msg)
-        : std::runtime_error(msg), remote(false) {}
+    explicit RpcException(const std::string& msg, std::string code = "")
+        : std::runtime_error(msg), remote(false), code(std::move(code)) {}
     explicit RpcException(Json remoteValue)
-        : std::runtime_error("rpc error: " + remoteValue.dump()), error(std::move(remoteValue)), remote(true) {}
+        : std::runtime_error("rpc error: " + remoteValue.dump()), error(std::move(remoteValue)), remote(true), code("EREMOTE") {}
 };
 
 // 服务端方法处理器：抛 std::runtime_error 转为 {"error": ...} 响应。
@@ -59,6 +63,10 @@ public:
 
     ~RpcProtocol() { close(); }
 
+    // 默认 RPC 超时（毫秒），对齐 JS 修复版 15s；0 表示关闭。
+    void setDefaultTimeoutMs(int64_t ms) { defaultTimeoutMs_.store(ms); }
+    int64_t defaultTimeoutMs() const { return defaultTimeoutMs_.load(); }
+
     void registerMethod(const std::string& name, Handler h) {
         std::lock_guard<std::mutex> lock(state_->mu);
         state_->handlers[name] = std::move(h);
@@ -75,7 +83,9 @@ public:
     }
 
     // 发送 JSON 请求并阻塞等待响应；对端错误响应抛 RpcException(remote=true)。
-    Json sendRequest(const std::string& method, Json params = Json::null(), const std::string& to = "") {
+    // timeoutMs：-1 用默认超时，0 关闭超时；超时抛 RpcException(code="ETIMEDOUT")，对齐 JS 修复版。
+    Json sendRequest(const std::string& method, Json params = Json::null(), const std::string& to = "",
+                     int64_t timeoutMs = -1) {
         std::string id = newUUID();
         auto pending = std::make_shared<Pending>();
         {
@@ -92,12 +102,12 @@ public:
             removePending(id);
             throw RpcException("send failed");
         }
-        return waitResult(id, pending);
+        return waitResult(id, pending, method, timeoutMs);
     }
 
-    // 二进制请求：handler 实参为 [Bytes(data), ...args]。
+    // 二进制请求：handler 实参为 [Bytes(data), ...args]；timeoutMs 语义同 sendRequest。
     Json sendRequestBinary(const std::string& method, const std::vector<uint8_t>& data,
-                           const std::vector<Json>& args = {}) {
+                           const std::vector<Json>& args = {}, int64_t timeoutMs = -1) {
         std::string id = newUUID();
         auto pending = std::make_shared<Pending>();
         {
@@ -109,7 +119,7 @@ public:
             removePending(id);
             throw RpcException("send failed");
         }
-        return waitResult(id, pending);
+        return waitResult(id, pending, method, timeoutMs);
     }
 
     // 单向事件
@@ -155,6 +165,7 @@ private:
 
     std::shared_ptr<State> state_;
     std::atomic<bool> closed_{false};
+    std::atomic<int64_t> defaultTimeoutMs_{15000};
     std::shared_ptr<MessageStream> ms_; // 最后声明：析构时先停读线程
 
     void removePending(const std::string& id) {
@@ -162,12 +173,25 @@ private:
         state_->pending.erase(id);
     }
 
-    Json waitResult(const std::string& id, std::shared_ptr<Pending> pending) {
+    Json waitResult(const std::string& id, std::shared_ptr<Pending> pending, const std::string& method,
+                    int64_t timeoutMs) {
+        int64_t effective = timeoutMs < 0 ? defaultTimeoutMs_.load() : timeoutMs;
         Json value;
         std::unique_ptr<RpcException> err;
         {
             std::unique_lock<std::mutex> lock(pending->mu);
-            pending->cv.wait(lock, [&] { return pending->done; });
+            if (effective > 0) {
+                if (!pending->cv.wait_for(lock, std::chrono::milliseconds(effective),
+                                          [&] { return pending->done; })) {
+                    // 超时：先移除 pending 再抛错，避免迟到响应写入已废弃的 pending
+                    lock.unlock();
+                    removePending(id);
+                    throw RpcException("RPC timeout after " + std::to_string(effective) + "ms: " + method,
+                                       "ETIMEDOUT");
+                }
+            } else {
+                pending->cv.wait(lock, [&] { return pending->done; });
+            }
             value = std::move(pending->value);
             err = std::move(pending->err);
         } // 先释放 pending 锁再取 state 锁，避免与 rejectAll 的锁序形成环

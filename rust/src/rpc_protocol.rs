@@ -5,7 +5,7 @@ use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, Once};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::json::{self, Json};
 use crate::message_stream::MessageStream;
@@ -21,18 +21,31 @@ pub const CONTENT_BINARY: u8 = 2;
 /// 服务端方法处理器：args 为展开后的参数；Err(String) 转为 {"error": ...} 响应。
 pub type Handler = Box<dyn Fn(Vec<Json>) -> Result<Json, String> + Send + Sync>;
 
-/// RPC 错误：Remote 携带对端原始 error 值（对齐 JS reject(response.error)）。
+/// RPC 错误：Remote 携带对端原始 error 值（对齐 JS reject(response.error)）；
+/// Timeout 为本地超时（code=ETIMEDOUT）。
 #[derive(Debug, Clone)]
 pub enum RpcError {
     Remote(Json),
     Message(String),
+    Timeout(String),
+}
+
+impl RpcError {
+    /// 错误码，对齐 JS 修复版 RpcError.code。
+    pub fn code(&self) -> &'static str {
+        match self {
+            RpcError::Remote(_) => "EREMOTE",
+            RpcError::Timeout(_) => "ETIMEDOUT",
+            RpcError::Message(_) => "",
+        }
+    }
 }
 
 impl fmt::Display for RpcError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             RpcError::Remote(v) => write!(f, "rpc error: {}", json::stringify(v)),
-            RpcError::Message(m) => write!(f, "{}", m),
+            RpcError::Message(m) | RpcError::Timeout(m) => write!(f, "{}", m),
         }
     }
 }
@@ -48,6 +61,8 @@ pub struct RpcProtocol {
     pending: Arc<Mutex<PendingMap>>,
     on_event: Arc<Mutex<Option<EventCb>>>,
     on_error: Arc<Mutex<Option<Box<dyn Fn(String) + Send>>>>,
+    /// 默认 RPC 超时（毫秒），对齐 JS 修复版 15s；0 表示关闭。
+    default_timeout_ms: AtomicU64,
     close_once: Once,
 }
 
@@ -60,6 +75,7 @@ impl RpcProtocol {
             pending: Arc::new(Mutex::new(HashMap::new())),
             on_event: Arc::new(Mutex::new(None)),
             on_error: Arc::new(Mutex::new(None)),
+            default_timeout_ms: AtomicU64::new(15000),
             close_once: Once::new(),
         });
 
@@ -99,13 +115,32 @@ impl RpcProtocol {
         *self.on_error.lock().unwrap() = Some(f);
     }
 
+    /// 设置默认 RPC 超时；Duration::ZERO 关闭。
+    pub fn set_default_timeout(&self, timeout: Duration) {
+        self.default_timeout_ms.store(timeout.as_millis() as u64, Ordering::SeqCst);
+    }
+
+    pub fn default_timeout(&self) -> Duration {
+        Duration::from_millis(self.default_timeout_ms.load(Ordering::SeqCst))
+    }
+
     /// 发送 JSON 请求并阻塞等待响应。
     pub fn send_request(&self, method: &str, params: Json) -> Result<Json, RpcError> {
         self.send_request_to(method, params, None)
     }
 
-    /// 带可选 to 路由字段的请求。
+    /// 带可选 to 路由字段的请求（默认超时）。
     pub fn send_request_to(&self, method: &str, params: Json, to: Option<&str>) -> Result<Json, RpcError> {
+        self.send_request_to_timeout(method, params, to, self.default_timeout())
+    }
+
+    /// 带显式超时的请求；Duration::ZERO 关闭超时。
+    pub fn send_request_timeout(&self, method: &str, params: Json, timeout: Duration) -> Result<Json, RpcError> {
+        self.send_request_to_timeout(method, params, None, timeout)
+    }
+
+    /// 带 to 路由与显式超时的请求；超时返回 RpcError::Timeout（code=ETIMEDOUT），对齐 JS 修复版。
+    pub fn send_request_to_timeout(&self, method: &str, params: Json, to: Option<&str>, timeout: Duration) -> Result<Json, RpcError> {
         let id = new_uuid();
         let (tx, rx) = mpsc::channel();
         self.pending.lock().unwrap().insert(id.clone(), tx);
@@ -121,11 +156,16 @@ impl RpcProtocol {
             self.pending.lock().unwrap().remove(&id);
             return Err(RpcError::Message(e.to_string()));
         }
-        rx.recv().map_err(|_| RpcError::Message("request channel closed".into()))?
+        self.wait_result(&id, rx, method, timeout)
     }
 
-    /// 发送二进制请求：handler 实参为 [Bytes(data), ...args]。
+    /// 发送二进制请求（默认超时）：handler 实参为 [Bytes(data), ...args]。
     pub fn send_request_binary(&self, method: &str, data: &[u8], args: Vec<Json>) -> Result<Json, RpcError> {
+        self.send_request_binary_timeout(method, data, args, self.default_timeout())
+    }
+
+    /// 带显式超时的二进制请求；Duration::ZERO 关闭超时。
+    pub fn send_request_binary_timeout(&self, method: &str, data: &[u8], args: Vec<Json>, timeout: Duration) -> Result<Json, RpcError> {
         let id = new_uuid();
         let (tx, rx) = mpsc::channel();
         self.pending.lock().unwrap().insert(id.clone(), tx);
@@ -135,7 +175,22 @@ impl RpcProtocol {
             self.pending.lock().unwrap().remove(&id);
             return Err(RpcError::Message(e.to_string()));
         }
-        rx.recv().map_err(|_| RpcError::Message("request channel closed".into()))?
+        self.wait_result(&id, rx, method, timeout)
+    }
+
+    /// 等待响应；超时先移除 pending 再返回 Timeout，避免迟到响应写入已废弃的 channel。
+    fn wait_result(&self, id: &str, rx: mpsc::Receiver<Result<Json, RpcError>>, method: &str, timeout: Duration) -> Result<Json, RpcError> {
+        if timeout.is_zero() {
+            return rx.recv().map_err(|_| RpcError::Message("request channel closed".into()))?;
+        }
+        match rx.recv_timeout(timeout) {
+            Ok(r) => r,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                self.pending.lock().unwrap().remove(id);
+                Err(RpcError::Timeout(format!("RPC timeout after {}ms: {}", timeout.as_millis(), method)))
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(RpcError::Message("request channel closed".into())),
+        }
     }
 
     /// 发送单向事件。

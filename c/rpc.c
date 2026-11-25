@@ -1,5 +1,6 @@
 #include "rpc.h"
 
+#include <errno.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -50,6 +51,7 @@ struct RpcProtocol {
     int active; /* 进行中的请求处理线程数 */
     pthread_cond_t active_cv;
     int closed;
+    int default_timeout_ms; /* 默认 RPC 超时，对齐 JS 修复版 15s；0 关闭 */
 };
 
 typedef struct {
@@ -440,12 +442,17 @@ static void on_stream_error(void* user, const char* msg) {
 RpcProtocol* rpc_create(MessageStream* ms) {
     RpcProtocol* rpc = (RpcProtocol*)calloc(1, sizeof(RpcProtocol));
     rpc->ms = ms;
+    rpc->default_timeout_ms = 15000;
     pthread_mutex_init(&rpc->mu, NULL);
     pthread_cond_init(&rpc->active_cv, NULL);
     ms_on_message(ms, on_stream_message, rpc);
     ms_on_error(ms, on_stream_error, rpc);
     ms_start(ms);
     return rpc;
+}
+
+void rpc_set_default_timeout(RpcProtocol* rpc, int timeoutMs) {
+    rpc->default_timeout_ms = timeoutMs;
 }
 
 void rpc_register(RpcProtocol* rpc, const char* name, IpcHandler h, void* user) {
@@ -473,31 +480,63 @@ void rpc_on_error(RpcProtocol* rpc, void (*cb)(void*, const char*), void* user) 
     pthread_mutex_unlock(&rpc->mu);
 }
 
-static RpcResult wait_pending(RpcProtocol* rpc, Pending* p) {
-    (void)rpc;
-    pthread_mutex_lock(&p->mu);
-    while (!p->done) pthread_cond_wait(&p->cv, &p->mu);
-    RpcResult r = p->result;
-    pthread_mutex_unlock(&p->mu);
-    /* deliver 方已不再触碰 p，此处安全释放 */
+static void pending_free(Pending* p) {
     pthread_mutex_destroy(&p->mu);
     pthread_cond_destroy(&p->cv);
     free(p);
-    return r;
+}
+
+static RpcResult wait_pending(RpcProtocol* rpc, Pending* p, int timeoutMs, const char* method) {
+    pthread_mutex_lock(&p->mu);
+    if (timeoutMs > 0) {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec += timeoutMs / 1000;
+        ts.tv_nsec += (long)(timeoutMs % 1000) * 1000000L;
+        if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+        while (!p->done && pthread_cond_timedwait(&p->cv, &p->mu, &ts) != ETIMEDOUT) {}
+    } else {
+        while (!p->done) pthread_cond_wait(&p->cv, &p->mu);
+    }
+    int done = p->done;
+    RpcResult r = p->result;
+    pthread_mutex_unlock(&p->mu);
+    if (done) {
+        /* deliver 方已不再触碰 p，此处安全释放 */
+        pending_free(p);
+        return r;
+    }
+    /* 超时：先尝试从 pending 链表摘除；若响应线程已抢先取走，
+     * 则等其 deliver 完成后释放迟到结果，避免泄漏/双重释放 */
+    if (pending_take(rpc, p->id) == p) {
+        pending_free(p);
+    } else {
+        pthread_mutex_lock(&p->mu);
+        while (!p->done) pthread_cond_wait(&p->cv, &p->mu);
+        RpcResult late = p->result;
+        pthread_mutex_unlock(&p->mu);
+        json_free(late.value);
+        json_free(late.error);
+        pending_free(p);
+    }
+    char msg[256];
+    snprintf(msg, sizeof(msg), "RPC timeout after %dms: %s", timeoutMs, method);
+    RpcResult timedOut = {NULL, json_str(msg), 0, "ETIMEDOUT"};
+    return timedOut;
 }
 
 static RpcResult send_and_wait(RpcProtocol* rpc, Pending* p, int msgType, int contentType,
-                               const unsigned char* body, size_t bodyLen) {
+                               const unsigned char* body, size_t bodyLen, int timeoutMs, const char* method) {
     size_t msgLen;
     unsigned char* msg = build_message(msgType, contentType, p->id, body, bodyLen, &msgLen);
     int ok = ms_send(rpc->ms, msg, msgLen);
     free(msg);
     if (!ok) {
         pending_remove(rpc, p->id);
-        RpcResult r = {NULL, json_str("send failed"), 0};
+        RpcResult r = {NULL, json_str("send failed"), 0, NULL};
         return r;
     }
-    return wait_pending(rpc, p);
+    return wait_pending(rpc, p, timeoutMs, method);
 }
 
 static Pending* pending_new(RpcProtocol* rpc) {
@@ -513,6 +552,11 @@ static Pending* pending_new(RpcProtocol* rpc) {
 }
 
 RpcResult rpc_send_request(RpcProtocol* rpc, const char* method, JsonValue* params, const char* to) {
+    return rpc_send_request_timeout(rpc, method, params, to, rpc->default_timeout_ms);
+}
+
+RpcResult rpc_send_request_timeout(RpcProtocol* rpc, const char* method, JsonValue* params, const char* to,
+                                   int timeoutMs) {
     Pending* p = pending_new(rpc);
     /* 组装 {"method":...,"params":...[,"to":...]}（params 借用，单独 dump） */
     JsonValue* mv = json_str(method);
@@ -533,17 +577,24 @@ RpcResult rpc_send_request(RpcProtocol* rpc, const char* method, JsonValue* para
     }
     free(methodJson);
     free(paramsJson);
-    RpcResult r = send_and_wait(rpc, p, TYPE_REQUEST, CONTENT_JSON, (unsigned char*)body, strlen(body));
+    RpcResult r = send_and_wait(rpc, p, TYPE_REQUEST, CONTENT_JSON, (unsigned char*)body, strlen(body),
+                                timeoutMs, method);
     free(body);
     return r;
 }
 
 RpcResult rpc_send_request_binary(RpcProtocol* rpc, const char* method,
                                   const unsigned char* data, size_t len, JsonValue* argsArr) {
+    return rpc_send_request_binary_timeout(rpc, method, data, len, argsArr, rpc->default_timeout_ms);
+}
+
+RpcResult rpc_send_request_binary_timeout(RpcProtocol* rpc, const char* method,
+                                          const unsigned char* data, size_t len, JsonValue* argsArr,
+                                          int timeoutMs) {
     Pending* p = pending_new(rpc);
     size_t bodyLen;
     unsigned char* body = encode_binary_request(method, data, len, argsArr, &bodyLen);
-    RpcResult r = send_and_wait(rpc, p, TYPE_REQUEST, CONTENT_BINARY, body, bodyLen);
+    RpcResult r = send_and_wait(rpc, p, TYPE_REQUEST, CONTENT_BINARY, body, bodyLen, timeoutMs, method);
     free(body);
     return r;
 }

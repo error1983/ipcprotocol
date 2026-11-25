@@ -215,7 +215,10 @@ char* json_dump(const JsonValue* v) {
 
 /* ---- 解析 ---- */
 
-typedef struct { const char* s; size_t i, n; } Parser;
+/* 递归深度上限：防止恶意深嵌套 JSON 打爆栈（超限返回 NULL 走解析失败路径） */
+#define JSON_MAX_DEPTH 64
+
+typedef struct { const char* s; size_t i, n; int depth; } Parser;
 
 static JsonValue* parse_value(Parser* p);
 
@@ -351,8 +354,13 @@ static JsonValue* parse_value(Parser* p) {
     skip_ws(p);
     if (p->i >= p->n) return NULL;
     char c = p->s[p->i];
-    if (c == '{') return parse_object(p);
-    if (c == '[') return parse_array(p);
+    if (c == '{' || c == '[') {
+        if (p->depth >= JSON_MAX_DEPTH) return NULL;
+        p->depth++;
+        JsonValue* v = (c == '{') ? parse_object(p) : parse_array(p);
+        p->depth--;
+        return v;
+    }
     if (c == '"') {
         char* s = parse_string(p);
         if (!s) return NULL;
@@ -379,7 +387,7 @@ static JsonValue* parse_value(Parser* p) {
 }
 
 JsonValue* json_parse(const char* s) {
-    Parser p = {s, 0, strlen(s)};
+    Parser p = {s, 0, strlen(s), 0};
     JsonValue* v = parse_value(&p);
     if (!v) return NULL;
     skip_ws(&p);

@@ -36,6 +36,7 @@ _ = Task.Run(async () =>
         var tag = RpcProtocol.Convert<string>(args[1]);
         return new { size = data.Length, tag, head = data.Take(4).ToArray() };
     });
+    rpc.RegisterMethod("slow", async _ => { await Task.Delay(500); return (object?)"late"; });
     serverReady.SetResult();
 });
 
@@ -113,7 +114,19 @@ await syncDone.Task.WaitAsync(TimeSpan.FromSeconds(3));
 Check("crc error detected", srvErrors.Count >= 1);
 Check("resync then rpc works", RpcProtocol.Convert<int>(await client.SendRequestAsync("add", new object[] { 10, 20 })) == 30);
 
-// 11. destroy 后资源清理
+// 11. RPC 超时：显式短超时触发 ETIMEDOUT，pending 清理后迟到响应不影响后续调用
+try
+{
+    await client.SendRequestAsync("slow", null, null, TimeSpan.FromMilliseconds(100));
+    Check("rpc timeout ETIMEDOUT", false);
+}
+catch (RpcException e) { Check("rpc timeout ETIMEDOUT", e.Code == "ETIMEDOUT" && e.Error!.ToString()!.Contains("slow")); }
+Check("after timeout rpc works", RpcProtocol.Convert<int>(await client.SendRequestAsync("add", new object[] { 1, 2 })) == 3);
+await Task.Delay(600); // 等 slow 的迟到响应到达（应被静默丢弃）
+Check("late response ignored", RpcProtocol.Convert<int>(await client.SendRequestAsync("add", new object[] { 5, 6 })) == 11);
+Check("default timeout is 15s", client.DefaultTimeout == TimeSpan.FromSeconds(15));
+
+// 12. destroy 后资源清理
 client.Dispose();
 listener.Stop();
 Console.WriteLine($"\nALL {passed} C# TESTS PASSED");

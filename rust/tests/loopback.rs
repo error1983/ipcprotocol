@@ -72,6 +72,10 @@ fn register_test_methods(rpc: &Arc<RpcProtocol>) {
         m.insert("head", Json::Arr(data[..4].iter().map(|b| Json::Num(*b as f64)).collect()));
         Ok(m)
     }));
+    rpc.register_method("slow", Box::new(|_| {
+        thread::sleep(Duration::from_millis(500));
+        Ok(Json::Str("late".into()))
+    }));
 }
 
 fn dial(server: &ServerHandle) -> (Arc<RpcProtocol>, TcpStream) {
@@ -207,5 +211,27 @@ fn crc_recovery() {
     // 恢复后通信继续
     let v = rpc.send_request("add", Json::Arr(vec![Json::Num(10.0), Json::Num(20.0)])).unwrap();
     assert_eq!(v.as_f64(), Some(30.0));
+    rpc.close();
+}
+
+#[test]
+fn rpc_timeout() {
+    let server = start_server();
+    let (rpc, _conn) = dial(&server);
+
+    assert_eq!(rpc.default_timeout(), Duration::from_secs(15));
+    // 显式短超时触发 ETIMEDOUT
+    let err = rpc
+        .send_request_timeout("slow", Json::Null, Duration::from_millis(100))
+        .unwrap_err();
+    assert_eq!(err.code(), "ETIMEDOUT");
+    assert!(matches!(err, RpcError::Timeout(_)));
+    // pending 已清理，后续调用正常
+    let v = rpc.send_request("add", Json::Arr(vec![Json::Num(1.0), Json::Num(2.0)])).unwrap();
+    assert_eq!(v.as_f64(), Some(3.0));
+    // 等 slow 的迟到响应到达（应被静默丢弃）
+    thread::sleep(Duration::from_millis(600));
+    let v = rpc.send_request("add", Json::Arr(vec![Json::Num(5.0), Json::Num(6.0)])).unwrap();
+    assert_eq!(v.as_f64(), Some(11.0));
     rpc.close();
 }

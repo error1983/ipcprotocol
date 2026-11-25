@@ -152,8 +152,12 @@ private:
     }
 
     struct Parser {
+        // 递归深度上限：防止恶意深嵌套 JSON 打爆栈（超限抛异常走解析失败路径）
+        static constexpr int MAX_DEPTH = 64;
+
         const std::string& s;
         size_t i;
+        int depth = 0;
 
         char peek() const { return i < s.size() ? s[i] : '\0'; }
 
@@ -168,8 +172,13 @@ private:
 
         Json value() {
             char c = peek();
-            if (c == '{') return object();
-            if (c == '[') return array();
+            if (c == '{' || c == '[') {
+                if (depth >= MAX_DEPTH) throw std::runtime_error("json: max depth exceeded");
+                depth++;
+                Json v = (c == '{') ? object() : array();
+                depth--;
+                return v;
+            }
             if (c == '"') return Json::ofStr(string());
             if (c == 't') { literal("true"); return Json::ofBool(true); }
             if (c == 'f') { literal("false"); return Json::ofBool(false); }

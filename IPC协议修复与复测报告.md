@@ -142,6 +142,7 @@ NativeService 单客户端门禁。**复核通过，报告可信。**
 
 报告§4 的 15s 默认 RPC 超时、3s 重同步超时断链、`ERESYNC` 拒绝在途请求属**行为变更**，
 本轮未移植到其它语言（各语言保持无默认超时，由调用方自行控制）；如需对齐可另行追加。
+**更新**：15s 默认 RPC 超时已在下一轮（§八）移植到全部七语言；3s 重同步断链与 `ERESYNC` 仍未移植。
 
 ### 7.5 复测结果（Windows / 回环 TCP）
 
@@ -157,3 +158,61 @@ NativeService 单客户端门禁。**复核通过，报告可信。**
 
 各语言回环均含 CRC 损坏注入→错误包→RESET_CONFIRM→重同步后 RPC 恢复用例；
 互操作覆盖 JSON/TEXT/BINARY/null/错误响应/方法不存在/75KB 二进制请求/事件/50 并发。
+
+## 八、P0 生产化加固：RPC 默认超时与 JSON 深度上限（本轮新增）
+
+针对生产评估中的两项 P0 阻断项：**七语言 RPC 无超时（对端假死→调用方永久挂起）**、
+**C/C++ JSON 解析无递归深度限制（深嵌套帧→栈溢出崩溃）**。线格式不变，既有调用方源码兼容。
+
+### 8.1 RPC 默认超时（对齐 JS 版语义）
+
+统一语义：默认 **15s**、实例级可配置、每调用可传显式超时（`0`/`Zero`/`null` 关闭超时保持旧行为）、
+超时先从 pending 表移除再报错、错误码 **`ETIMEDOUT`**（消息 `RPC timeout after {ms}ms: {method}`）、
+迟到响应因 pending 已移除而静默丢弃，不影响后续调用；远程错误统一带 `EREMOTE` 码。
+
+| 语言 | 等待原语 | 默认超时配置 | 每调用超时 | 错误码载体 |
+|---|---|---|---|---|
+| Python | `asyncio.wait_for` | `RpcProtocol(ms, default_timeout=15.0)`（秒） | `send_request(..., timeout=)` | `RpcError.code` |
+| C# | `Task.WaitAsync` | `DefaultTimeout` 属性（TimeSpan） | `SendRequestAsync(..., TimeSpan?)` / `SendRequestBinaryWithTimeoutAsync` | `RpcException.Code` |
+| Java | `ScheduledExecutorService` 定时摘除 + `whenComplete` 取消 | `set/getDefaultTimeoutMs` | `sendRequest(m,p,to,timeoutMs)` / `sendRequestBinaryWithTimeout` | `RpcException.getCode()` |
+| Go | `time.NewTimer` + `select` | `DefaultTimeout` 字段（time.Duration） | `SendRequestTimeout` / `SendRequestToTimeout` / `SendRequestBinaryTimeout` | `RpcError.Code` |
+| Rust | `mpsc::recv_timeout` | `set_default_timeout` / `default_timeout`（AtomicU64，毫秒） | `send_request_timeout` / `send_request_to_timeout` / `send_request_binary_timeout` | `RpcError::Timeout` 变体 + `code()` |
+| C++ | `cv.wait_for` | `setDefaultTimeoutMs` / `defaultTimeoutMs`（atomic） | `sendRequest(..., timeoutMs=-1)`（-1 用默认，0 关闭） | `RpcException.code` |
+| C | `pthread_cond_timedwait` + `clock_gettime(CLOCK_REALTIME)` 绝对期限 | `rpc_set_default_timeout(rpc, ms)` | `rpc_send_request_timeout` / `rpc_send_request_binary_timeout` | `RpcResult.code`（静态字符串，不需释放） |
+
+C 的超时/响应竞态处理：`wait_pending` 超时后先 `pending_take(id)` 原子摘除——
+若摘到本 pending（等待方赢）直接释放；若已被响应线程取走（响应方赢），则有界等待其 deliver 完成，
+释放迟到结果后再释放 pending，杜绝泄漏与双重释放。Java 的守护线程调度器在 `close()` 时 `shutdownNow`。
+
+### 8.2 JSON 递归深度上限（64 层）
+
+- **c/json.c**：`#define JSON_MAX_DEPTH 64`，Parser 增加 `depth` 计数，`{`/`[` 入层前校验，
+  超限返回 NULL → RPC 层反序列化失败 → 回 `Invalid request payload` 错误响应（复用 B5 路径），进程不崩溃。
+- **cpp/include/ipc/json.hpp**：`Parser::MAX_DEPTH = 64`，超限抛 `std::runtime_error("json: max depth exceeded")`
+  → `handleMessage` catch → 回错误响应，读循环继续。
+- 其余语言解析器为迭代/托管实现或已有深度保护，本轮未改。
+
+### 8.3 新增测试
+
+- 七语言均注册 `slow` handler（睡 500ms），用例：显式 100ms 超时 → 断言 `ETIMEDOUT` →
+  等迟到响应到达后再发正常请求，验证 pending 清理与链路无损；同时断言默认超时为 15s。
+- C/C++ 另加 JSON 深度用例：200 层嵌套 parse 失败（C 返回 NULL / C++ 抛异常）、60 层成功；
+  e2e：客户端发 200 层嵌套参数的 `echo` 帧 → 服务端回 `Invalid request payload` → 后续 `add` 正常，服务不崩溃。
+
+### 8.4 复测结果（Windows / 回环 TCP）
+
+| 语言 | 回环测试（含新增超时/深度用例） |
+|---|---|
+| Python | 16/16 |
+| C# | 16/16 |
+| Java | 17/17 |
+| Go | `go test -count=1 -race` 全部 ok（含 TestRPCTimeout） |
+| Rust | 8/8 |
+| C++ | 21/21 |
+| C | 19/19（`-Wall` 零警告） |
+
+互操作冒烟：Python↔Node 12/12 通过（线格式零回归）；`examples/csharp` 编译 0 警告 0 错误（API 向后兼容）。
+
+### 8.5 仍未覆盖的 P0/P1 项
+
+心跳/keepalive（半开连接检测）、3s 重同步超时断链 + `ERESYNC`、鉴权与版本协商仍缺，见生产评估结论。

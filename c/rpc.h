@@ -16,6 +16,7 @@ typedef struct {
     JsonValue* value; /* 成功结果（所有权归调用方） */
     JsonValue* error; /* 失败时的错误值：remote=1 为对端原始 error 值，否则为 JSON_STR 消息 */
     int remote;
+    const char* code; /* 错误码静态字符串（如 "ETIMEDOUT"），NULL 表示未指定；不需释放 */
 } RpcResult;
 
 /* 接管 ms 所有权；先注册回调再启动读循环 */
@@ -25,11 +26,21 @@ void rpc_register(RpcProtocol* rpc, const char* name, IpcHandler h, void* user);
 void rpc_on_event(RpcProtocol* rpc, void (*cb)(void* user, int contentType, JsonValue* content), void* user);
 void rpc_on_error(RpcProtocol* rpc, void (*cb)(void* user, const char* msg), void* user);
 
-/* params 为借用（NULL 视为 null）；to 可为 NULL。阻塞等待响应。 */
+/* 默认 RPC 超时（毫秒），对齐 JS 修复版 15s；0 表示关闭。 */
+void rpc_set_default_timeout(RpcProtocol* rpc, int timeoutMs);
+
+/* params 为借用（NULL 视为 null）；to 可为 NULL。阻塞等待响应（默认超时）。 */
 RpcResult rpc_send_request(RpcProtocol* rpc, const char* method, JsonValue* params, const char* to);
+/* 带显式超时（毫秒）的请求；0 关闭超时。超时返回 error 消息且 code="ETIMEDOUT"。 */
+RpcResult rpc_send_request_timeout(RpcProtocol* rpc, const char* method, JsonValue* params, const char* to,
+                                   int timeoutMs);
 /* argsArr 为借用的 JSON_ARR（可为 NULL）；handler 实参为 [Bytes(data), ...args] */
 RpcResult rpc_send_request_binary(RpcProtocol* rpc, const char* method,
                                   const unsigned char* data, size_t len, JsonValue* argsArr);
+/* 带显式超时（毫秒）的二进制请求；0 关闭超时。 */
+RpcResult rpc_send_request_binary_timeout(RpcProtocol* rpc, const char* method,
+                                          const unsigned char* data, size_t len, JsonValue* argsArr,
+                                          int timeoutMs);
 void rpc_result_free(RpcResult* r);
 
 int rpc_send_text(RpcProtocol* rpc, const char* text);
