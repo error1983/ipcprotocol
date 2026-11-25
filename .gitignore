@@ -12,8 +12,10 @@ coverage
 
 # 构建产物（任意层级）
 **/bin/
+!rust/src/bin/
 **/obj/
 **/out/
+**/target/
 **/__pycache__/
 *.pyc
 java/dbg*.txt

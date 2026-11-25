@@ -1,7 +1,7 @@
 # IPC 跨语言协议规格（PROTOCOL.md）
 
 本文档定义 `MessageStream.js` / `RpcProtocol.js` 所用协议的**线格式（wire format）与行为语义**，
-作为 Node.js / Python / C# / Java 各实现的唯一互操作依据。
+作为 Node.js / Python / C# / Java / Go / Rust / C++ / C 各实现的唯一互操作依据。
 
 - 规格版本：1.0（与仓库内 JS 原版行为一致）
 - 字节序约定：除特别注明外，长度字段为**小端（LE）**；二进制请求体内的长度字段为**大端（BE）**
@@ -351,6 +351,23 @@ sendRequestBinary("upload", <75KB bytes>, "tag-1")
 | 事件监听 | `onEvent(cb)` | `on_event(cb)` | `Event += cb` | `onEvent(cb)` |
 | 销毁 | `destroy()` | `await destroy()` | `Dispose()` | `close()` |
 
+新增四语言（均为同步阻塞式请求 API）：
+
+| 概念 | Go | Rust | C++ | C |
+|---|---|---|---|---|
+| 构造消息流 | `NewMessageStream(r, w)` | `MessageStream::new(r, w)` | `MessageStream(stream)` | `ms_create(io, crc, max)` |
+| 启动读循环 | `NewRpcProtocol` 内自动 `Start()` | `RpcProtocol::new` 内自动 `start()` | `RpcProtocol` 构造内自动 `start()` | `rpc_create` 内自动 `ms_start()` |
+| 发送消息 | `Send(data)` | `send(&data)` | `send(data)` | `ms_send(ms, data, len)` |
+| 注册方法 | `RegisterMethod(name, h)` | `register_method(name, h)` | `registerMethod(name, h)` | `rpc_register(rpc, name, h, user)` |
+| 发请求 | `SendRequest(m, params)` | `send_request(m, params)` | `sendRequest(m, params)` | `rpc_send_request(rpc, m, params, to)` |
+| 二进制请求 | `SendRequestBinary(m, data, args...)` | `send_request_binary(m, data, args)` | `sendRequestBinary(m, data, args)` | `rpc_send_request_binary(rpc, m, data, len, args)` |
+| 事件监听 | `rpc.OnEvent = cb`（字段回调） | `on_event(cb)` | `onEvent(cb)` | `rpc_on_event(rpc, cb, user)` |
+| 销毁 | `Close()` | `close()` | `close()` | `rpc_destroy(rpc)` |
+
+> Go/Rust/C++/C 的 `send_request` 系列为**同步阻塞**调用（内部用 channel / mpsc /
+> condvar 等待响应），可在任意线程/协程并发调用；`to` 路由字段分别经
+> `SendRequestTo` / `send_request_to` / `sendRequest(..., to)` / 第 4 参数传入。
+
 ### 9.2 JSON 值映射
 
 | JSON | Node | Python | C# | Java（内置 Json） |
@@ -362,11 +379,21 @@ sendRequestBinary("upload", <75KB bytes>, "tag-1")
 | true/false | boolean | bool | `JsonElement` | `Boolean` |
 | null | null | None | `JsonElement`(Null) | `null` |
 
+新增四语言的 JSON 值表示：
+
+| 语言 | 值类型 | 字节数组 |
+|---|---|---|
+| Go | `any`（`map[string]any` / `[]any` / `string` / `float64` / `bool` / `nil`） | `[]byte`，序列化前经 `normalizeJSON` 转数字数组 |
+| Rust | 内置 `Json` 枚举（`Null/Bool/Num/Str/Arr/Obj/Bytes`，零依赖） | `Json::Bytes`，stringify 输出数字数组 |
+| C++ | 内置 `ipc::Json` 类（同上七种类型，仅标准库） | `Json::Bytes`，dump 输出数字数组 |
+| C | `JsonValue`（`JSON_NULL/BOOL/NUM/STR/ARR/OBJ/BYTES`，手写解析器） | `json_bytes()`，dump 输出数字数组 |
+
 ### 9.3 必须对齐的序列化细节
 
 1. **字节数组进 JSON 必须是数字数组**（`[0,1,2,255]`），对齐 `JSON.stringify(Buffer)`。
    - C# `System.Text.Json` 默认输出 Base64，**必须加转换器**（仓库已实现）。
    - Java 内置 `Json.stringify(byte[])` 已按数字数组输出。
+   - Rust/C++/C 的内置 JSON 均实现了 `Bytes → 数字数组`；Go 在发送前递归归一化 `[]byte`。
 2. JSON 输出紧凑（无多余空白）；非 ASCII 字符可直接输出 UTF-8 或 `\uXXXX` 转义，两者等价。
 3. 浮点整数值（如 `2.0`）JS 输出 `2`；接收端按数值比较即可，不必逐字节比对 JSON 文本。
 4. UUID 字节序见 §5.1（C# 特别小心）。
@@ -379,6 +406,10 @@ sendRequestBinary("upload", <75KB bytes>, "tag-1")
 | Python | asyncio 单线程 | 构造即安全（读任务在同步注册完成前不会运行） |
 | C# | 后台 `Task` | **构造不自动读**；`RpcProtocol` 挂好事件后调用 `Start()` |
 | Java | 守护读线程 | **构造不自动读**；`RpcProtocol` 挂好监听器后调用 `start()` |
+| Go | goroutine + channel | `NewRpcProtocol` 先挂 `OnMessage/OnError` 再 `ms.Start()`（`sync.Once`） |
+| Rust | 独立读线程 + `Arc<Mutex>` | `RpcProtocol::new` 先挂回调再 `ms.start()` |
+| C++ | detached `std::thread` + condvar | `RpcProtocol` 构造先挂 `onMessage/onError` 再 `start()` |
+| C | detached pthread + mutex/cond | `rpc_create` 先 `ms_on_message` 再 `ms_start()` |
 
 > 教训：多线程实现若在构造函数里立即启动读循环，对端"连接即发数据"时，
 > 早到消息会在监听器注册前被分发（listeners=0）而丢失，客户端首请求永久挂起。
@@ -391,6 +422,17 @@ sendRequestBinary("upload", <75KB bytes>, "tag-1")
 | 对端错误响应 | `reject(response.error)` | `RpcError(error)` | `RpcException(Error)` | `RpcException(getError())` |
 | 流错误拒绝 pending | `Error("Request failed: ...")` | 同左 | 同左 | 同左 |
 | 销毁拒绝 pending | `Error("RPC Protocol destroyed")` | 同左 | 同左 | 同左 |
+
+新增四语言：
+
+| 场景 | Go | Rust | C++ | C |
+|---|---|---|---|---|
+| 对端错误响应 | `RpcError{Value any}` | `RpcError::Remote(Json)` | `RpcException(remote=true)` | `RpcResult{remote=1, error=原始值}` |
+| 本地/流错误 | 普通 `error` | `RpcError::Message(String)` | `RpcException(remote=false)` | `RpcResult{remote=0, error=JSON_STR}` |
+
+> C 的所有权约定：handler 的 `args` 为借用指针；返回值由 rpc 层接管；
+> `RpcResult` 用完须 `rpc_result_free()`；事件回调中的 `content` 为借用，
+> 需留存时按类型深拷贝（`JSON_BYTES` 不能经 dump+parse 往返，会退化为普通数组）。
 
 ---
 
@@ -446,6 +488,22 @@ ipcprotocol/
 │   ├── MessageStream.java / RpcProtocol.java / Json.java
 │   ├── LoopbackTest.java                  # 回环测试（13 项）
 │   └── Example.java                       # server/client 双模式示例
+├── go/                                    # Go 1.21+，仅标准库
+│   ├── message_stream.go / rpc_protocol.go
+│   ├── rpc_test.go                        # 回环测试（9 项，go test -race）
+│   └── example/main.go                    # server/client 双模式示例
+├── rust/                                  # Rust，零依赖（cargo --offline 可构建）
+│   ├── src/{json,message_stream,rpc_protocol,lib}.rs
+│   ├── tests/loopback.rs                  # 回环测试（7 项）
+│   └── src/bin/example.rs                 # server/client 双模式示例
+├── cpp/                                   # C++17，仅标准库（header-only）
+│   ├── include/ipc/{json,message_stream,rpc_protocol,tcp}.hpp
+│   ├── tests/loopback_test.cpp            # 回环测试（13 项）
+│   └── examples/example.cpp               # server/client 双模式示例
+├── c/                                     # C11 + pthreads（Windows 下 Winsock）
+│   ├── json.{h,c} / message_stream.{h,c} / rpc.{h,c} / tcp.{h,c}
+│   ├── loopback_test.c                    # 回环测试（12 项）
+│   └── example.c                          # server/client 双模式示例
 └── examples/
     ├── node_server.js / node_client.js    # Node 原版互操作端
     ├── python_server.py                   # Python 示例服务端
@@ -466,25 +524,58 @@ dotnet run --project csharp/IpcProtocol.Tests
 javac -encoding UTF-8 -d java/out java/src/ipc/*.java
 java -cp java/out ipc.LoopbackTest
 
+# Go 回环（含竞态检测）
+cd go; go test -count=1 -race ./...
+
+# Rust 回环（零依赖，离线可构建）
+cd rust; cargo test --offline
+
+# C++ 回环（MinGW g++ 15 / 任意 C++17 编译器）
+g++ -std=c++17 -O2 -Wall -Icpp/include cpp/tests/loopback_test.cpp -o cpp/out/loopback_test.exe -lws2_32
+cpp/out/loopback_test.exe
+
+# C 回环（MinGW gcc，C11 + pthreads）
+gcc -std=c11 -O2 -Ic c/loopback_test.c c/json.c c/message_stream.c c/rpc.c c/tcp.c -o c/out/loopback_test.exe -lws2_32 -lpthread
+c/out/loopback_test.exe
+
 # 跨语言互操作（先起服务端，再跑客户端；端口可自定）
 node examples/node_server.js 9000          # Node 原版服务端
 python examples/python_server.py 9001      # Python 服务端
 dotnet run --project examples/csharp -- server 9002
 java -cp java/out ipc.Example server 9003
+go run ./example server 9004               # Go 服务端（在 go/ 目录下）
+cargo run --offline --bin example -- server 9005   # Rust 服务端（在 rust/ 目录下）
+g++ -std=c++17 -O2 -Icpp/include cpp/examples/example.cpp -o cpp/out/example.exe -lws2_32
+cpp/out/example.exe server 9006            # C++ 服务端
+gcc -std=c11 -O2 -Ic c/example.c c/json.c c/message_stream.c c/rpc.c c/tcp.c -o c/out/example.exe -lws2_32 -lpthread
+c/out/example.exe server 9007              # C 服务端
 
 node examples/node_client.js <port>        # Node 客户端（10 项）
 dotnet run --project examples/csharp -- client <port>   # C# 客户端（11 项）
 java -cp java/out ipc.Example client <port>             # Java 客户端（11 项）
+go run ./example client <port>             # Go 客户端（11 项，在 go/ 目录下）
+cargo run --offline --bin example -- client <port>     # Rust 客户端（11 项）
+cpp/out/example.exe client <port>          # C++ 客户端（11 项）
+c/out/example.exe client <port>            # C 客户端（11 项）
 ```
+
+> Windows/MinGW 注意：C/C++ 源码已定义 `WIN32_LEAN_AND_MEAN` 避免 winsock2.h 与
+> windows.h 的 RPC 头冲突；链接需 `-lws2_32`，C 还需 `-lpthread`（winpthreads）。
 
 ### 11.3 已验证的互操作矩阵
 
-| 客户端 \ 服务端 | Node | Python | C# | Java |
-|---|---|---|---|---|
-| Node | ✅ | ✅ | ✅ | ✅ |
-| Python | ✅ | ✅(回环) | — | — |
-| C# | ✅ | ✅ | ✅(回环) | ✅ |
-| Java | ✅ | ✅ | ✅ | ✅(回环) |
+| 客户端 \ 服务端 | Node | Python | C# | Java | Go | Rust | C++ | C |
+|---|---|---|---|---|---|---|---|---|
+| Node | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Python | ✅ | ✅(回环) | — | — | — | — | — | — |
+| C# | ✅ | ✅ | ✅(回环) | ✅ | — | — | — | — |
+| Java | ✅ | ✅ | ✅ | ✅(回环) | — | — | — | — |
+| Go | ✅ | — | — | — | ✅(回环) | — | — | — |
+| Rust | ✅ | — | — | — | — | ✅(回环) | — | — |
+| C++ | ✅ | — | — | — | — | — | ✅(回环) | — |
+| C | ✅ | — | — | — | — | — | — | ✅(回环) |
+
+✅ = 已实测通过；✅(回环) = 同语言 TCP 回环通过；— = 未测（线格式一致，理论可互操作）。
 
 覆盖：JSON/TEXT/BINARY 响应、Unicode、null、错误响应、方法不存在、
 75KB 二进制请求、三类事件、50 并发请求、CRC 损坏注入后的重同步恢复。
