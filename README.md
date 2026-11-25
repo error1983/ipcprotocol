@@ -266,4 +266,4 @@ c/out/example.exe client <port>                            # C 客户端
 
 ## 许可
 
-内部项目，版权归 wgweb-group 所有。
+本项目基于 [MIT License](LICENSE) 开源，版权归 wgweb-group 所有。
