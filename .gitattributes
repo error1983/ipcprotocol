@@ -1,0 +1,19 @@
+# 默认按文本处理并在仓库内统一为 LF，避免跨平台行尾噪音。
+* text=auto eol=lf
+
+# 二进制文件不做行尾转换与文本 diff
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.zip binary
+*.exe binary
+*.dll binary
+*.pdb binary
+*.lib binary
+
+# Windows 工程文件保持 CRLF，便于 Visual Studio 正常打开
+*.sln text eol=crlf
+*.csproj text eol=crlf
+*.vcxproj text eol=crlf

@@ -43,7 +43,8 @@
 - **进程守护**：Node `NativeService` 指数退避（500ms→30s）+ 崩溃/重启/放弃事件；Python / C# / Java 各提供同语义 `Supervisor`；
 - **多客户端会话**：主会话 + `callTo` 精确路由 + `broadcastText` 广播，主会话断开自动切换；
 - **token 热轮换**：`rotateToken({ graceMs })` 新旧 token 并存、宽限期后自动吊销，已握手会话不受影响；
-- **跨平台**：Windows（Winsock / 命名管道）与 Linux（POSIX socket / Unix domain socket）同一份源码编译运行。
+- **跨平台**：Windows（Winsock / 命名管道）与 Linux（POSIX socket / Unix domain socket）同一份源码编译运行；
+- **C# Native AOT**：C# 实现在反射被禁用的 AOT 运行时下完整可用（约 3.4 MB 单文件产物），业务载荷走 `JsonTypeInfo` 源生成，见 [csharp/NATIVE_AOT.md](csharp/NATIVE_AOT.md)。
 
 ## 目录结构
 
@@ -58,8 +59,10 @@
 │   ├── test_loopback.py                # 回环测试
 │   └── test_interop_node.py            # 与 Node 原版互操作测试
 ├── csharp/
-│   ├── IpcProtocol/                    # C# 类库（net8.0），含 Supervisor.cs
-│   └── IpcProtocol.Tests/              # 回环测试
+│   ├── IpcProtocol/                    # C# 类库（net8.0），含 Supervisor.cs、AOT 安全的 JsonPayload.cs
+│   ├── IpcProtocol.Tests/              # 回环测试
+│   ├── IpcProtocol.AotSmoke/           # Native AOT 冒烟工程（publish 即验证）
+│   └── NATIVE_AOT.md                   # C# AOT 支持说明与用法
 ├── java/src/ipc/                       # Java 实现（11+，零依赖，含内置 JSON）
 │   ├── MessageStream.java / RpcProtocol.java / Json.java
 │   ├── Supervisor.java                 # 宿主侧进程守护
