@@ -293,6 +293,18 @@ gcc -std=c11 -O2 -Wall -Ic c/loopback_test.c c/json.c c/message_stream.c c/rpc.c
 ./c/out/loopback_test
 ```
 
+### 常驻子进程保活示例
+
+主进程拉起的常驻子进程可直接用 `examples/reconnect_client_grace.py`：每次（重）连自动 `hello()`
+完成鉴权与能力协商，断链按指数退避重连（心跳由协议内置），并注册 `system.shutdown` 供主进程优雅停机
+（Windows 没有真实 SIGTERM，走 RPC 指令最可靠）。
+
+```powershell
+python examples/reconnect_client_grace.py 127.0.0.1:9000 --exit-with-parent
+```
+
+Node 侧退出前调用 `await rpc.call('system.shutdown', ['主进程退出'])`，等子进程 `close`，3s 未退出再 `SIGKILL` 兜底。
+
 ### 跨语言互操作示例
 
 任选一端做服务端、另一端做客户端（以下为 Windows 命令）：
