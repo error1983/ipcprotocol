@@ -305,6 +305,20 @@ python examples/reconnect_client_grace.py 127.0.0.1:9000 --exit-with-parent
 
 Node 侧退出前调用 `await rpc.call('system.shutdown', ['主进程退出'])`，等子进程 `close`，3s 未退出再 `SIGKILL` 兜底。
 
+### 抓包与流量解析
+
+命名管道与 Unix socket 都不走网卡，Wireshark 抓不到；实际能拿到的是应用层写入的字节。
+`tools/dump_parser.js` 负责把 dump 还原成帧与可读报文（校验 CRC、拆 REQUEST/RESPONSE/EVENT/PING/HELLO、解析二进制请求体）：
+
+```powershell
+node tools/dump_parser.js capture.ipcd --stats        # IPCD 抓包（带方向+时间戳）
+node tools/dump_parser.js raw.bin --format raw --dir "Node→Py"
+node tools/dump_parser.js frida.txt --format hex --json
+```
+
+抓包方式：包住 `socket.write`（或 `WriteFile`）把每次写入的 chunk 原样记录，格式见脚本头部注释；
+HELLO 里的 token 会被自动隐去，可安全贴进 issue。
+
 ### 跨语言互操作示例
 
 任选一端做服务端、另一端做客户端（以下为 Windows 命令）：
