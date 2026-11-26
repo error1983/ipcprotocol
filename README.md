@@ -293,7 +293,11 @@ gcc -std=c11 -O2 -Wall -Ic c/loopback_test.c c/json.c c/message_stream.c c/rpc.c
 ./c/out/loopback_test
 ```
 
-# 跨语言互操作：任选一端做服务端，另一端做客户端
+### 跨语言互操作示例
+
+任选一端做服务端、另一端做客户端（以下为 Windows 命令）：
+
+```powershell
 node examples/node_server.js 9000                          # Node 服务端
 python examples/python_server.py 9001                      # Python 服务端
 dotnet run --project examples/csharp -- server 9002        # C# 服务端
