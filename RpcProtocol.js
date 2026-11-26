@@ -22,6 +22,40 @@ export class RpcError extends Error {
 }
 
 export class RpcProtocol extends EventEmitter {
+    /**
+     * 在 MessageStream 之上提供 RPC 语义：请求/响应、事件、心跳、HELLO 鉴权与能力协商。
+     * 一个 stream 只能配一个 RpcProtocol；构造时立刻挂上流监听，收到 HELLO/REQUEST 会自动处理。
+     *
+     * @param {import('./MessageStream.js').MessageStream} messageStream 已创建的流实例，必填。
+     * @param {Object} [options={}] 以下全部可选，默认值即推荐配置。
+     * @param {number} [options.heartbeatIntervalMs=5000] 心跳发送间隔（毫秒）；0 = 关闭心跳。
+     *     心跳只在空闲时发，用来发现「静默断连」（进程被杀、管道被拔）这类收不到 EOF 的情况。
+     * @param {number} [options.heartbeatTimeoutMs=15000] 超过该时长没收到任何入站消息即判定断链，
+     *     结算所有在途请求（code='EHEARTBEAT'）并 destroy 流；调太小会在长任务/GC 停顿时误杀。
+     * @param {boolean} [options.heartbeatSkipWhilePending=true] 有在途请求时跳过超时判定。
+     *     对端在跑长任务时不一定及时回 PONG，这是正常现象，交给请求级超时兜底更准。
+     * @param {string} [options.authToken=null] 客户端凭据。服务端开了鉴权时，不传或传错会在
+     *     hello() 阶段被拒（返回 Unauthorized），后续业务请求也一律被拒。
+     * @param {string} [options.requiredToken=null] 服务端要求客户端出示的 token（单个）。
+     * @param {string[]} [options.requiredTokens] 服务端接受的 token 集合，轮换期间新旧并存；
+     *     传入时优先于 requiredToken。
+     * @param {string[]} [options.capabilities=['ping','binary','event']] 本端在 HELLO 里声明的能力，
+     *     对端据此决定是否启用心跳/二进制/事件。
+     * @param {string} [options.implName='node'] 实现名，出现在 HELLO 里，便于对端日志区分是哪个语言端。
+     * @param {boolean} [options.heartbeatRequireCapability=false] 严格模式：仅当对端在 HELLO 里
+     *     声明了 'ping' 才发心跳，兼容不支持心跳的旧实现。
+     *
+     * @example 服务端：接受子进程连接并暴露方法
+     * const rpc = new RpcProtocol(new MessageStream({ socket }), { requiredToken: token });
+     * rpc.registerMethod('add', (a, b) => a + b);          // 同步或 async 均可
+     * rpc.on('error', (err) => console.error(err.code));
+     *
+     * @example 客户端：握手后调用
+     * const rpc = new RpcProtocol(stream, { authToken: process.env.IPC_TOKEN });
+     * await rpc.hello();                                   // 开鉴权时必须在业务请求前调用
+     * const sum = await rpc.sendRequest('add', [1, 2]);    // 15s 默认超时
+     * const raw = await rpc.sendRequestBinary('upload', buffer); // 二进制请求体
+     */
     constructor(messageStream, options = {}) {
         if (!messageStream) throw new Error('messageStream is undefined');
         super();

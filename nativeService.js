@@ -8,6 +8,77 @@ import fs from 'fs';
 import { randomUUID } from 'crypto';
 
 export class NativeService extends EventEmitter {
+    /**
+     * 一个 NativeService = 一个本机 IPC 端点 + 一个受管子进程。
+     *
+     * 它负责把两边接起来：
+     * 1. 在命名管道（Windows `\\.\pipe\...`）或 Unix socket 上监听，接受任意语言客户端连入；
+     * 2. spawn 子进程，并通过环境变量把 `PIPE_NAME` / `IPC_TOKEN` / `IPC_REQUIRE_AUTH` 传下去，
+     *    子进程据此连回来（八语言实现都会读这几个变量）；
+     * 3. 子进程异常退出时按指数退避重启，并维护多客户端会话与 token 轮换。
+     *
+     * 注意：构造函数只做配置校验、生成 token 与管道名，**不会启动任何东西**；
+     * 监听与 spawn 发生在 `start()`，连接可用性等 `waitForReady()` / `waitForConnection()`。
+     *
+     * @param {string} name 实例名：用于日志前缀、错误信息、默认管道名（如 `native_service_<name>_...`）。
+     * @param {Object} options
+     * @param {string} options.cmd 必填。子进程可执行文件，直接交给 spawn。
+     * @param {string[]} [options.args=[]] 子进程参数。
+     * @param {Object} [options.env={}] 额外环境变量，会与 process.env 合并后传给子进程
+     *     （同名的以这里为准；PIPE_NAME/IPC_TOKEN/IPC_REQUIRE_AUTH 由本类注入，不要自己塞）。
+     * @param {boolean} [options.windowsHide=true] Windows 下隐藏子进程控制台窗口。
+     * @param {string[]} [options.stdio=['pipe','pipe','pipe']] spawn 的 stdio 配置；
+     *     stdout/stderr 被 pipe 时由本类转发到 console，便于调试子进程输出。
+     * @param {string} [options.pipeName] 覆盖监听地址。默认 Windows 为
+     *     `\\.\pipe\native_service_<name>_<pid>_<时间戳>_<随机>`，Unix 为 `/tmp/native_service_<name>_...sock`；
+     *     需要外部进程（非本类 spawn）连入时，指定一个固定路径。
+     * @param {boolean} [options.requireAuth=true] 是否开启 HELLO 鉴权（默认开）。
+     *     开启后未完成 hello 的请求一律被拒（Unauthorized），防止同机任意进程随意调用。
+     * @param {string} [options.authToken=null] 指定固定 token；不传则每次随机生成（推荐）。
+     *     需要自己 spawn 子进程、或让多个进程共用一个 token 时才显式指定。
+     * @param {boolean} [options.autoRestart=true] 子进程非预期退出后是否自动重启。
+     * @param {number} [options.restartDelayMs=500] 首次重启延迟（毫秒），此后每次翻倍。
+     * @param {number} [options.maxRestartDelayMs=30000] 退避上限（毫秒）。
+     * @param {number} [options.maxRestarts=Infinity] 连续重启次数上限，超过后 emit `give-up` 不再重启。
+     * @param {number} [options.restartResetAfterMs=30000] 连接稳定运行超过该时长则清零重启计数，
+     *     避免「偶尔崩一次」累积成永久放弃。
+     * @param {number} [options.maxClients=8] 同时接入的客户端上限；首个连入者为主会话（默认路由目标）。
+     * @param {number} [options.tokenGraceMs=300000] `rotateToken()` 后旧 token 的宽限期（毫秒），
+     *     期内新旧 token 并存，已握手的会话不受影响。
+     * @param {number} [options.heartbeatIntervalMs] 透传给每条连接的 RpcProtocol，默认 5000；0 关闭心跳。
+     * @param {number} [options.heartbeatTimeoutMs] 透传，默认 15000。
+     * @param {boolean} [options.heartbeatRequireCapability=false] 透传：仅当对端声明 ping 能力才发心跳。
+     *
+     * 事件：
+     * - `connect` (socket) 有客户端连入；
+     * - `clientConnected` / `clientDisconnected` ({ id, socket }) 会话增删；
+     * - `primaryChanged` ({ id }) 主会话切换（原主会话断开时）；
+     * - `disconnect` 所有客户端都断开；
+     * - `event` (message) 子进程发来的事件；
+     * - `error` (err) 连接或子进程错误（内部已挂兜底监听，不会打崩进程）；
+     * - `crash` ({ code, signal, crashes }) / `restarting` ({ attempt, delay }) /
+     *   `restarted` ({ attempt }) / `give-up` ({ attempts, exitCode }) 守护生命周期；
+     * - `stopped` 显式 stop() 完成；
+     * - `tokenRotated` / `tokenRevoked` 鉴权轮换。
+     *
+     * @example
+     * import { NativeService } from './nativeService.js';
+     *
+     * const svc = new NativeService('py-worker', {
+     *     cmd: 'python',
+     *     args: ['worker.py'],          // 子进程里读 os.environ['PIPE_NAME'] / ['IPC_TOKEN'] 连回来
+     *     // requireAuth 默认 true：自动生成 token 并注入子进程，业务代码无需关心
+     * });
+     *
+     * svc.registerMethod('ping', () => 'pong');   // 供子进程反向调用
+     * svc.start();                                 // 启动监听 + spawn 子进程
+     * await svc.waitForReady();                    // 等子进程握手连上（默认 30s 超时）
+     *
+     * const sum = await svc.call.add(1, 2);         // Proxy 语法糖，等价 sendRequest('add', [1, 2])
+     * svc.on('crash', ({ code }) => console.warn('子进程异常退出:', code));
+     *
+     * await svc.stop();                            // 显式停止：不触发 crash，也不再重启
+     */
     constructor(name, options) {
         super();
         const {

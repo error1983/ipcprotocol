@@ -42,6 +42,40 @@ function ipcError(message, code) {
 }
 
 export class MessageStream extends EventEmitter {
+    /**
+     * 把一条「已建立连接」的 socket 包装成带分帧的 IPC 流。
+     *
+     * 职责边界：只管帧——长度头、CRC32 校验、粘包/拆包、缓冲区上限、损坏后重同步；
+     * 不管帧里装的是什么。报文语义（REQUEST/RESPONSE/EVENT…）由上层的 RpcProtocol 负责。
+     * 一般不需要直接 new 它：Node 端用 NativeService，其他语言端用各自的 stream+rpc 封装。
+     *
+     * @param {Object} options
+     * @param {import('net').Socket} options.socket 必填。已处于 connected 状态的 socket；
+     *     Windows 命名管道、Unix domain socket、TCP 在 Node 里都是 net.Socket，用法一致。
+     * @param {boolean} [options.enableCRC=true] 是否启用 CRC32。
+     *     ⚠️ 两端必须一致，协议内没有协商机制（PROTOCOL.md §3），不一致会表现为持续 CRC 失败重同步。
+     * @param {number} [options.maxBufferSize=268435456] 单帧与缓冲区上限（字节，默认 256MiB）。
+     *     超限会发 BUFFER_OVERFLOW 错误包并重置缓冲，对端据此断开重连。
+     * @param {number} [options.syncTimeout=3000] 校验失败后重同步握手的超时（毫秒）；
+     *     期间发送被门控，<=0 表示关闭该机制（不建议）。
+     *
+     * 事件（都建议挂监听，否则只能看到 console 输出）：
+     * - `message` (buffer) 收到一整帧，参数是未解析的 Buffer，交给 RpcProtocol 处理；
+     * - `error` (err) 流异常，err.code 为 'ECLOSED' / 'ESOCKET' / 'ERESYNC' 等；
+     * - `close` 流已关闭（显式 destroy 或对端断开）；
+     * - `syncComplete` 重同步完成，发送门控解除。
+     *
+     * @example
+     * import net from 'node:net';
+     * import { MessageStream } from './MessageStream.js';
+     * import { RpcProtocol } from './RpcProtocol.js';
+     *
+     * const socket = net.connect('\\\\.\\pipe\\my_service');
+     * const stream = new MessageStream({ socket });          // 默认启用 CRC
+     * stream.on('error', (err) => console.error('流断开:', err.code));
+     * const rpc = new RpcProtocol(stream, { authToken: process.env.IPC_TOKEN });
+     * await rpc.hello();                                      // 开鉴权时必须先握手
+     */
     constructor(options) {
         if (!options || !options.socket) throw new Error('socket is undefined');
         super();
