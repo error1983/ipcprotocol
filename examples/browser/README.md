@@ -27,16 +27,22 @@
 
 ## 文件
 
+浏览器三层实现已经抽成 npm 子包 **`packages/ipcprotocol-browser/`**（包名 `ipcprotocol-browser`）。
+本目录下的四个 `.js` 只是**转发文件**，保留旧相对路径可用（演示页与老代码不用改）。
+
 | 文件 | 说明 |
 |---|---|
 | `../ws-relay-gateway.js` | 零依赖 WebSocket 中继网关（自带最小 RFC6455 实现，生产建议换 `ws` 库） |
 | `../ws-rpc-demo.js` | 端到端自检：两个 peer 经网关互调 RPC、推事件、传二进制、验证超时 |
-| `ws-transport.js` | 传输适配器：把一条 WS 连接伪装成 `net.Socket`（`on`/`write`/`destroy`/`drain`） |
-| `mini-stream.js` | 浏览器帧层：纯 `Uint8Array`，无 Node 依赖，线格式与 `MessageStream` 逐字节一致 |
-| `mini-rpc.js` | 浏览器 RPC 层：REQUEST/RESPONSE/EVENT/PING/PONG/HELLO/HELLO_ACK + 鉴权 + 二进制请求体 |
-| `rpc-protocol-compat.js` | 把上面两层包成 **Node 版 `RpcProtocol` 的接口形状**，业务代码两端一字不改 |
+| `ws-transport.js` → `packages/.../src/ws-transport.js` | 传输适配器：把一条 WS 连接伪装成 `net.Socket`（`on`/`write`/`destroy`/`drain`） |
+| `mini-stream.js` → `packages/.../src/mini-stream.js` | 浏览器帧层：纯 `Uint8Array`，无 Node 依赖，线格式与 `MessageStream` 逐字节一致 |
+| `mini-rpc.js` → `packages/.../src/mini-rpc.js` | 浏览器 RPC 层：REQUEST/RESPONSE/EVENT/PING/PONG/HELLO/HELLO_ACK + 鉴权 + 二进制请求体 |
+| `rpc-protocol-compat.js` → `packages/.../src/rpc-protocol-compat.js` | 把上面两层包成 **Node 版 `RpcProtocol` 的接口形状**，业务代码两端一字不改 |
 | `rpc-demo.html` | 双浏览器互调演示页（两个标签页各当一个 peer，点按钮互相调） |
 | `serve.js` | 零依赖静态服务器（`type=module` 不能用 `file://` 打开，需要它） |
+
+子包有自己的 README、类型声明与子路径导出：见
+[packages/ipcprotocol-browser/README.md](../../packages/ipcprotocol-browser/README.md)。
 
 ## 跑起来
 
@@ -60,7 +66,8 @@ node examples/browser/serve.js 8080               # 静态服务（演示页用�
 适配器暴露的是 `net.Socket` 的形状，所以 Node 里可以原样套 `MessageStream + RpcProtocol`：
 
 ```js
-import { WsTransport } from './browser/ws-transport.js';
+// 仓库里 npm install 之后，子包已被 workspace 链接到 node_modules
+import { WsTransport } from 'ipcprotocol-browser';
 import { MessageStream } from '../MessageStream.js';
 import { RpcProtocol } from '../RpcProtocol.js';
 
@@ -77,9 +84,7 @@ console.log(await rpc.sendRequest('add', [1, 2]));
 所以这里配了一套同线格式的前端精简栈，纯 `Uint8Array`，走浏览器原生 `WebSocket`：
 
 ```js
-import { WsTransport } from './ws-transport.js';
-import { MiniMessageStream } from './mini-stream.js';
-import { MiniRpc } from './mini-rpc.js';
+import { WsTransport, MiniMessageStream, MiniRpc } from 'ipcprotocol-browser';
 
 const link = new WsTransport('ws://127.0.0.1:9100', { peer: 'alice', to: 'bob' });
 const stream = new MiniMessageStream(link);          // 帧层：分帧 + CRC32 + 错误包 + 重同步
@@ -104,13 +109,13 @@ await rpc.sendRequestBinary('upload', new Uint8Array([1, 2, 3]), 'tag');
 ## 同一套写法：compat 层（推荐业务代码用它）
 
 `mini-stream.js` + `mini-rpc.js` 是「两层分开」的低层 API。如果希望**前端和 Node 端的业务代码一字不改**，
-用 `rpc-protocol-compat.js`：它把这两层包成 Node 版 `RpcProtocol` 的接口形状，两端只差一行 import。
+用子包里的 compat 层：它把这两层包成 Node 版 `RpcProtocol` 的接口形状，两端只差一行 import。
 
 ```js
 // Node 端（进程 / 子进程 / 本机服务）
 import { RpcProtocol, RpcError } from '../../RpcProtocol.js';
 // 浏览器端
-import { RpcProtocol, RpcError } from './rpc-protocol-compat.js';
+import { RpcProtocol, RpcError } from 'ipcprotocol-browser';
 
 // ——— 下面这部分两端完全相同 ———
 const rpc = new RpcProtocol(stream, { authToken, implName: 'demo', heartbeatIntervalMs: 5000 });

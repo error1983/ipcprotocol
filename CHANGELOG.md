@@ -3,6 +3,27 @@
 所有值得注意的变更都记录在这里。
 版本号对应仓库发布版本；线格式版本（HELLO 中声明的 `version`）自 1.0 起未变。
 
+## 未发布
+
+**浏览器 / WebSocket 互通（新增）**
+
+- 新增 `examples/ws-relay-gateway.js`：零依赖 WebSocket 中继网关（最小 RFC6455 实现），
+  路由信封 `[srcLen][src][dstLen][dst][IPC 字节]` 放在传输层，**协议帧零改动**；
+- 新增 `packages/ipcprotocol-browser`（npm 包 `ipcprotocol-browser`）：浏览器侧精简栈
+  `WsTransport` / `MiniMessageStream` / `MiniRpc` / `RpcProtocol`（compat 层），纯 `Uint8Array`、无 Node 依赖；
+- compat 层与 Node 版 `RpcProtocol` 接口同形：前端与 Node 端业务代码只差一行 `import`，
+  已用同一段 scenario 比对 29 个观察点全部一致；
+- 子包提供类型声明（`.d.ts`）与子路径导出 `ipcprotocol-browser/{transport,stream,rpc,compat}`；
+- 新增 `examples/browser/rpc-demo.html` 双浏览器互调演示与 `examples/browser/serve.js` 零依赖静态服务；
+- `/peers` 增加 CORS 头，浏览器跨源可查在线节点；
+- CI 新增 `browser` 作业：包解析、接口一致性、真实 WS 链路、网关自检与发布内容检查。
+
+**工具与文档**
+
+- 新增 `tools/dump_parser.js`：解析抓包（framed / raw / hex 三种输入、CRC 自检、二进制请求体拆解、断帧重对齐）；
+- `MessageStream` / `RpcProtocol` / `NativeService` 构造器补齐 JSDoc 接入注解（零逻辑变更）；
+- 新增 `examples/reconnect_client_grace.py`：常驻子进程保活 + `system.shutdown` 优雅退出。
+
 ## 1.2.0
 
 **C#：Native AOT 支持**

@@ -1,0 +1,58 @@
+{
+  "name": "ipcprotocol-browser",
+  "version": "1.2.0",
+  "description": "浏览器侧 IPC/RPC 栈：把 ipcprotocol 的二进制帧搬到 WebSocket 上，浏览器之间、浏览器与本机进程之间互相 RPC",
+  "type": "module",
+  "license": "MIT",
+  "sideEffects": false,
+  "main": "./src/index.js",
+  "types": "./src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.d.ts",
+      "default": "./src/index.js"
+    },
+    "./transport": {
+      "types": "./src/ws-transport.d.ts",
+      "default": "./src/ws-transport.js"
+    },
+    "./stream": {
+      "types": "./src/mini-stream.d.ts",
+      "default": "./src/mini-stream.js"
+    },
+    "./rpc": {
+      "types": "./src/mini-rpc.d.ts",
+      "default": "./src/mini-rpc.js"
+    },
+    "./compat": {
+      "types": "./src/rpc-protocol-compat.d.ts",
+      "default": "./src/rpc-protocol-compat.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "ipc",
+    "rpc",
+    "websocket",
+    "browser",
+    "binary",
+    "protocol",
+    "ipcprotocol"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/error1983/ipcprotocol.git",
+    "directory": "packages/ipcprotocol-browser"
+  },
+  "homepage": "https://github.com/error1983/ipcprotocol#readme",
+  "bugs": {
+    "url": "https://github.com/error1983/ipcprotocol/issues"
+  }
+}

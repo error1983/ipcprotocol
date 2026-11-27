@@ -333,18 +333,36 @@ node examples/browser/serve.js 8080              # 双浏览器互调演示（�
 #   http://127.0.0.1:8080/examples/browser/rpc-demo.html?peer=bob&to=alice
 ```
 
-三层各司其职：
+三层各司其职（实现都在子包 `packages/ipcprotocol-browser/`，`examples/browser/` 下只是转发文件）：
 
-- `examples/browser/ws-transport.js` —— 传输层：把一条 WS 连接伪装成 `net.Socket`，
+- `packages/ipcprotocol-browser/src/ws-transport.js` —— 传输层：把一条 WS 连接伪装成 `net.Socket`，
   Node 侧可直接套现有 `MessageStream + RpcProtocol`。
-- `examples/browser/mini-stream.js` + `mini-rpc.js` —— 浏览器专用的精简栈，纯 `Uint8Array`、无 Node 依赖，
+- `.../mini-stream.js` + `.../mini-rpc.js` —— 浏览器专用的精简栈，纯 `Uint8Array`、无 Node 依赖，
   帧格式与本仓库逐字节一致（已实测可与 Node 原版双向互调）。
-- `examples/browser/rpc-protocol-compat.js` —— 把精简栈包成 **Node 版 `RpcProtocol` 的接口形状**：
+- `.../rpc-protocol-compat.js` —— 把精简栈包成 **Node 版 `RpcProtocol` 的接口形状**：
   前端与 Node 端业务代码只差一行 `import`，`registerMethod / hello / sendRequest / sendRequestBinary /
   事件 / RpcError` 写法完全一致。
 - `examples/browser/rpc-demo.html` —— 两个标签页互为 peer 的可视化演示。
 
-信封格式、边界与限制见 [examples/browser/README.md](examples/browser/README.md)。
+浏览器侧直接装子包（npm workspace，也可单独发布）：
+
+```bash
+npm install ipcprotocol-browser
+```
+
+```js
+import { WsTransport, MiniMessageStream, RpcProtocol } from 'ipcprotocol-browser';
+
+const link = new WsTransport('ws://127.0.0.1:9100', { peer: 'alice', to: 'bob' });
+const rpc = new RpcProtocol(new MiniMessageStream(link), { implName: 'browser/alice' });
+rpc.registerMethod('add', (a, b) => a + b);     // 与 Node 端写法一致
+await rpc.hello();
+console.log(await rpc.sendRequest('add', [1, 2]));
+```
+
+子包的接口、子路径导出（`/transport`、`/stream`、`/rpc`、`/compat`）与限制见
+[packages/ipcprotocol-browser/README.md](packages/ipcprotocol-browser/README.md)；
+信封格式、边界与网关说明见 [examples/browser/README.md](examples/browser/README.md)。
 
 ### 跨语言互操作示例
 

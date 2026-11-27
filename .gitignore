@@ -4,6 +4,7 @@ build
 coverage
 .env
 *.log
+*.tgz
 
 # 构建产物（任意层级）
 **/bin/

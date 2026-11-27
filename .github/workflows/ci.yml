@@ -25,6 +25,24 @@ jobs:
       - run: node tests/v112/test_auth_caps.js
       - run: node tests/v112/test_multiclient_rotation.js
 
+  browser:
+    name: Browser package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm install
+      - name: Resolve subpackage by name
+        run: node --input-type=module -e "const m = await import('ipcprotocol-browser'); console.log('exports:', Object.keys(m).sort().join(','))"
+      - run: node tests/browser/test_compat_parity.mjs
+      - run: node tests/browser/test_ws_gateway.mjs
+      - run: node examples/ws-rpc-demo.js
+      - name: Check publish payload
+        run: npm pack -w ipcprotocol-browser --dry-run
+
   python:
     name: Python
     runs-on: ubuntu-latest

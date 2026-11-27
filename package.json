@@ -4,6 +4,9 @@
   "type": "module",
   "private": true,
   "license": "MIT",
+  "workspaces": [
+    "packages/*"
+  ],
   "dependencies": {
     "uuid": "^9.0.0"
   }
