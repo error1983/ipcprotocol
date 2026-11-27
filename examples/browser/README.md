@@ -117,6 +117,8 @@ node examples/browser/serve.js 8080
 页面上的每个节点都同时注册了 `add/greet/echo/blob/now/upload` 六个方法，
 可以两个标签页各点一下对方的按钮，观察双向调用。
 
+![双浏览器互调演示](rpc-demo.png)
+
 ## 已知边界
 
 1. **一个适配器 = 一条「本端 ↔ 某对端」链路**。要和 N 个对端通信，就开 N 个适配器（各自一个 `RpcProtocol`）。
