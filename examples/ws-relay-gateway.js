@@ -269,13 +269,24 @@ export function createRelay(options = {}) {
 
     const server = http.createServer((req, res) => {
         const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+        // 浏览器里通常在另一个源（静态服务 :8080）拉 /peers，允许跨源读取
+        const cors = {
+            'access-control-allow-origin': '*',
+            'access-control-allow-methods': 'GET, OPTIONS',
+            'access-control-allow-headers': 'content-type',
+        };
+        if (req.method === 'OPTIONS') {
+            res.writeHead(204, cors);
+            res.end();
+            return;
+        }
         if (url.pathname === '/peers') {
             const list = [...relay.peers.values()].map((p) => p.status());
-            res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+            res.writeHead(200, { ...cors, 'content-type': 'application/json; charset=utf-8' });
             res.end(JSON.stringify({ count: list.length, peers: list, unroutable: relay.unroutable, unroutedBytes: relay.unroutedBytes, dropped: relay.dropped }));
             return;
         }
-        res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
+        res.writeHead(200, { ...cors, 'content-type': 'text/plain; charset=utf-8' });
         res.end('ipcprotocol ws relay\n用 ws://host:port/?peer=<id> 接入，GET /peers 查看在线节点\n');
     });
 

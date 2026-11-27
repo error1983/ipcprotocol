@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ipcprotocol · 双浏览器 RPC 演示</title>
+<style>
+    :root {
+        --bg: #0f1115; --panel: #171a21; --panel2: #1e222b; --line: #2a2f3a;
+        --text: #e6e9ef; --muted: #8b93a3; --accent: #4c8dff; --ok: #34c38f; --warn: #f5a524; --err: #f2555a;
+        --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    * { box-sizing: border-box; }
+    body {
+        margin: 0; padding: 20px; background: var(--bg); color: var(--text);
+        font: 14px/1.6 system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+    }
+    h1 { font-size: 18px; margin: 0 0 4px; }
+    .sub { color: var(--muted); font-size: 12px; margin-bottom: 16px; }
+    .sub code { font-family: var(--mono); color: #9fb4d8; }
+
+    .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; margin-bottom: 14px; }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end; }
+    .field { display: flex; flex-direction: column; gap: 4px; }
+    .field label { font-size: 11px; color: var(--muted); letter-spacing: .04em; }
+    input {
+        background: var(--panel2); border: 1px solid var(--line); border-radius: 7px; color: var(--text);
+        padding: 7px 9px; font: 13px var(--mono); outline: none; min-width: 150px;
+    }
+    input:focus { border-color: var(--accent); }
+    button {
+        background: var(--panel2); border: 1px solid var(--line); color: var(--text); border-radius: 7px;
+        padding: 7px 12px; font-size: 13px; cursor: pointer; transition: .15s;
+    }
+    button:hover:not(:disabled) { border-color: var(--accent); color: #fff; }
+    button:disabled { opacity: .45; cursor: not-allowed; }
+    button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+    button.ghost { background: transparent; }
+
+    .status { display: flex; gap: 14px; align-items: center; flex-wrap: wrap; margin-top: 12px; font-size: 12px; color: var(--muted); }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--err); display: inline-block; margin-right: 6px; }
+    .dot.on { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
+
+    .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+    @media (max-width: 860px) { .cols { grid-template-columns: 1fr; } }
+
+    .panel h2 { font-size: 13px; margin: 0 0 10px; color: var(--muted); font-weight: 600; letter-spacing: .06em; text-transform: uppercase; }
+    .methods { display: flex; flex-wrap: wrap; gap: 6px; }
+    .chip {
+        font: 12px var(--mono); background: #14301f; border: 1px solid #245c3c; color: #7ee2a8;
+        padding: 3px 8px; border-radius: 999px;
+    }
+    .actions { display: flex; flex-direction: column; gap: 8px; }
+    .actions .line { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    .actions .hint { color: var(--muted); font-size: 12px; }
+
+    #log {
+        height: 320px; overflow: auto; background: #0b0d11; border: 1px solid var(--line); border-radius: 10px;
+        padding: 10px; font: 12px/1.55 var(--mono);
+    }
+    .ln { white-space: pre-wrap; word-break: break-word; }
+    .t { color: #5b6474; }
+    .out { color: #7fb0ff; }
+    .in { color: #7ee2a8; }
+    .er { color: #ff8b90; }
+    .sys { color: #b9a0ff; }
+</style>
+</head>
+<body>
+
+<h1>ipcprotocol · 双浏览器 RPC 演示</h1>
+<div class="sub">
+    两个标签页各是一个 peer，经 WebSocket 中继网关互相调用 —— 帧格式与命名管道 IPC 完全一致。
+    开法：<code>?peer=alice&amp;to=bob</code> 与 <code>?peer=bob&amp;to=alice</code>
+</div>
+
+<div class="panel">
+    <div class="row">
+        <div class="field">
+            <label>网关</label>
+            <input id="gateway" value="ws://127.0.0.1:9100" />
+        </div>
+        <div class="field">
+            <label>本端 peer</label>
+            <input id="peer" value="alice" />
+        </div>
+        <div class="field">
+            <label>对端 peer</label>
+            <input id="to" value="bob" />
+        </div>
+        <button class="primary" id="connect">连接</button>
+        <button class="ghost" id="disconnect" disabled>断开</button>
+        <button class="ghost" id="clear">清空日志</button>
+    </div>
+    <div class="status">
+        <span><span id="dot" class="dot"></span><span id="state">未连接</span></span>
+        <span id="caps">caps: —</span>
+        <span id="online">在线: —</span>
+    </div>
+</div>
+
+<div class="cols">
+    <div class="panel">
+        <h2>本端暴露的方法（对方可调）</h2>
+        <div class="methods">
+            <span class="chip">add(a,b)</span>
+            <span class="chip">greet(name)</span>
+            <span class="chip">echo(obj)</span>
+            <span class="chip">blob()</span>
+            <span class="chip">now()</span>
+            <span class="chip">upload(bytes,tag)</span>
+        </div>
+        <div class="actions" style="margin-top:12px">
+            <div class="line">
+                <button data-act="json" disabled>发 JSON 事件</button>
+                <button data-act="text" disabled>发文本事件</button>
+                <button data-act="bin" disabled>发二进制事件</button>
+                <span class="hint">事件由本端推给对方，对方触发 on('event')</span>
+            </div>
+        </div>
+    </div>
+
+    <div class="panel">
+        <h2>远程调用（打到对端）</h2>
+        <div class="actions">
+            <div class="line">
+                <button data-call="add" disabled>add(1, 2)</button>
+                <button data-call="greet" disabled>greet(对端名字)</button>
+                <button data-call="echo" disabled>echo({hello})</button>
+            </div>
+            <div class="line">
+                <button data-call="now" disabled>now()</button>
+                <button data-call="blob" disabled>blob()</button>
+                <button data-call="upload" disabled>upload(5B, tag)</button>
+            </div>
+            <div class="line">
+                <button data-call="nope" disabled>调用不存在的方法</button>
+                <span class="hint">用于观察错误如何回传</span>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div id="log" aria-live="polite"></div>
+
+<script type="module">
+import { WsTransport } from './ws-transport.js';
+import { MiniMessageStream } from './mini-stream.js';
+import { MiniRpc } from './mini-rpc.js';
+
+const $ = (id) => document.getElementById(id);
+const logEl = $('log');
+
+function log(text, kind = 'sys') {
+    const ts = new Date().toTimeString().slice(0, 8);
+    const div = document.createElement('div');
+    div.className = 'ln';
+    div.innerHTML = `<span class="t">${ts}</span> <span class="${kind}">${text}</span>`;
+    logEl.appendChild(div);
+    logEl.scrollTop = logEl.scrollHeight;
+}
+
+const hex = (u8, max = 24) => [...u8.slice(0, max)].map((b) => b.toString(16).padStart(2, '0')).join(' ') +
+    (u8.length > max ? ` …(+${u8.length - max}B)` : '');
+
+let link = null;
+let stream = null;
+let rpc = null;
+
+// ---------- URL 预填 ----------
+const q = new URLSearchParams(location.search);
+if (q.get('peer')) $('peer').value = q.get('peer');
+if (q.get('to')) $('to').value = q.get('to');
+if (q.get('gw')) $('gateway').value = q.get('gw');
+
+// ---------- 本地方法 ----------
+const localMethods = {
+    add: (a, b) => a + b,
+    greet: (name) => `hello ${name}`,
+    echo: (obj) => obj,
+    blob: () => new Uint8Array([0x00, 0x01, 0x02, 0xff]),
+    now: () => new Date().toISOString(),
+    upload: (data, tag) => ({ size: data.length, tag, head: hex(data, 4) }),
+};
+
+// ---------- 连接 ----------
+async function connect() {
+    const gateway = $('gateway').value.trim();
+    const peer = $('peer').value.trim();
+    const to = $('to').value.trim();
+    if (!gateway || !peer) { log('网关与 peer 不能为空', 'er'); return; }
+
+    setBusy(true);
+    try {
+        link = new WsTransport(gateway, { peer, to });
+        link.on('error', (err) => log(`transport: ${err.code} ${err.message}`, 'er'));
+        link.on('close', () => { log('链路已关闭', 'er'); setConnected(false); });
+
+        await new Promise((resolve, reject) => {
+            const timer = setTimeout(() => reject(new Error('连接超时')), 5000);
+            link.once('open', () => { clearTimeout(timer); resolve(); });
+            link.once('error', (err) => { clearTimeout(timer); reject(err); });
+        });
+
+        stream = new MiniMessageStream(link);
+        stream.on('error', (err) => log(`stream: ${err.code} ${err.message}`, 'er'));
+
+        rpc = new MiniRpc(stream, { implName: `browser/${peer}`, heartbeatIntervalMs: 5000 });
+        rpc.on('error', (err) => log(`rpc: ${err.code} ${err.message}`, 'er'));
+        rpc.on('event', (msg) => {
+            const body = msg.content instanceof Uint8Array ? `binary ${hex(msg.content)}` : JSON.stringify(msg.content);
+            log(`← event  ${body}`, 'in');
+        });
+        for (const [name, fn] of Object.entries(localMethods)) rpc.registerMethod(name, fn);
+
+        const ack = await rpc.hello(5000);
+        log(`已连接 ${gateway}，hello ok，caps=[${(ack.caps || []).join(',')}]`, 'sys');
+        $('caps').textContent = `caps: ${(ack.caps || []).join(',') || '—'}`;
+        setConnected(true);
+        refreshPeers();
+    } catch (err) {
+        const hint = err.code === 'ETIMEOUT' || /timeout/i.test(err.message || '')
+            ? '（对端 peer 不在线？先让另一个标签页连接）' : '';
+        log(`连接失败: ${err.code || ''} ${err.message} ${hint}`, 'er');
+        cleanup();
+        setConnected(false);
+    } finally {
+        setBusy(false);
+    }
+}
+
+function cleanup() {
+    try { rpc?.destroy(); } catch { }
+    try { stream?.destroy(); } catch { }
+    try { link?.destroy(); } catch { }
+    rpc = null; stream = null; link = null;
+}
+
+function setConnected(on) {
+    $('dot').classList.toggle('on', on);
+    $('state').textContent = on ? `已连接（${$('peer').value} → ${$('to').value}）` : '未连接';
+    $('connect').disabled = on;
+    $('disconnect').disabled = !on;
+    for (const btn of document.querySelectorAll('[data-call],[data-act]')) btn.disabled = !on;
+    if (!on) { $('caps').textContent = 'caps: —'; $('online').textContent = '在线: —'; }
+}
+
+function setBusy(busy) {
+    $('connect').disabled = busy;
+    if (busy) $('state').textContent = '连接中…';
+}
+
+// ---------- 在线节点（走网关的 /peers） ----------
+async function refreshPeers() {
+    if (!link) return;
+    const http = link.url.replace('ws://', 'http://').replace('wss://', 'https://');
+    try {
+        const res = await fetch(`${http}/peers`);
+        const info = await res.json();
+        $('online').textContent = `在线: ${info.peers.map((p) => p.id).join(', ') || '—'}`;
+    } catch { $('online').textContent = '在线: 查询失败'; }
+}
+
+// ---------- 远程调用 ----------
+async function call(method) {
+    if (!rpc) return;
+    const to = $('to').value.trim() || 'remote';
+    const args = {
+        add: [1, 2],
+        greet: [to],
+        echo: [{ hello: 'world', n: 1 }],
+        now: [],
+        blob: [],
+        upload: ['<5B binary>', 'tag-browser'],
+        nope: [],
+    }[method] || [];
+
+    const started = performance.now();
+    log(`→ ${method}(${args.map((a) => JSON.stringify(a)).join(', ')})`, 'out');
+    try {
+        const result = method === 'upload'
+            ? await rpc.sendRequestBinary('upload', new Uint8Array([9, 8, 7, 6, 5]), 'tag-browser')
+            : await rpc.sendRequest(method, args);
+        const ms = (performance.now() - started).toFixed(1);
+        const shown = result instanceof Uint8Array ? `binary ${hex(result)}` : JSON.stringify(result);
+        log(`← ${method} = ${shown}  (${ms}ms)`, 'in');
+    } catch (err) {
+        log(`← ${method} 失败: ${err.code} ${err.message}`, 'er');
+    }
+}
+
+document.querySelectorAll('[data-call]').forEach((btn) => {
+    btn.addEventListener('click', () => call(btn.dataset.call));
+});
+
+document.querySelectorAll('[data-act]').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+        if (!rpc) return;
+        const act = btn.dataset.act;
+        try {
+            if (act === 'json') { await rpc.sendJson({ from: $('peer').value, at: Date.now() }); log('→ event json', 'out'); }
+            else if (act === 'text') { await rpc.sendText(`hi from ${$('peer').value}`); log('→ event text', 'out'); }
+            else { await rpc.sendBinary(new Uint8Array([1, 2, 3])); log('→ event binary', 'out'); }
+        } catch (err) { log(`发送事件失败: ${err.message}`, 'er'); }
+    });
+});
+
+$('connect').addEventListener('click', connect);
+$('disconnect').addEventListener('click', () => { cleanup(); setConnected(false); log('已断开', 'sys'); });
+$('clear').addEventListener('click', () => { logEl.innerHTML = ''; });
+
+setConnected(false);
+log('提示：另一个标签页用 ?peer=bob&to=alice 打开；两人都点「连接」后即可互调。', 'sys');
+</script>
+</body>
+</html>

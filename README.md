@@ -327,10 +327,20 @@ HELLO 里的 token 会被自动隐去，可安全贴进 issue。
 ```powershell
 node examples/ws-relay-gateway.js --port 9100    # 零依赖网关，GET /peers 看在线节点
 node examples/ws-rpc-demo.js                     # 端到端自检：11 项断言
+
+node examples/browser/serve.js 8080              # 双浏览器互调演示（开两个标签页）
+#   http://127.0.0.1:8080/examples/browser/rpc-demo.html?peer=alice&to=bob
+#   http://127.0.0.1:8080/examples/browser/rpc-demo.html?peer=bob&to=alice
 ```
 
-适配器 `examples/browser/ws-transport.js` 把一条 WS 连接伪装成 `net.Socket`，
-Node 侧可直接套现有 `MessageStream + RpcProtocol`；浏览器侧需要配前端精简栈（详见该目录 README）。
+三层各司其职：
+
+- `examples/browser/ws-transport.js` —— 传输层：把一条 WS 连接伪装成 `net.Socket`，
+  Node 侧可直接套现有 `MessageStream + RpcProtocol`。
+- `examples/browser/mini-stream.js` + `mini-rpc.js` —— 浏览器专用的精简栈，纯 `Uint8Array`、无 Node 依赖，
+  帧格式与本仓库逐字节一致（已实测可与 Node 原版双向互调）。
+- `examples/browser/rpc-demo.html` —— 两个标签页互为 peer 的可视化演示。
+
 信封格式、边界与限制见 [examples/browser/README.md](examples/browser/README.md)。
 
 ### 跨语言互操作示例
