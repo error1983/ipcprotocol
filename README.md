@@ -319,6 +319,20 @@ node tools/dump_parser.js frida.txt --format hex --json
 抓包方式：包住 `socket.write`（或 `WriteFile`）把每次写入的 chunk 原样记录，格式见脚本头部注释；
 HELLO 里的 token 会被自动隐去，可安全贴进 issue。
 
+### 浏览器 / WebSocket 互通（可选）
+
+把同一套 IPC 帧搬到 WebSocket 上，配一个只认路由信封、不解析协议内容的中继网关，
+浏览器之间、浏览器与本机进程之间就能互相 RPC —— 帧格式不变，`dump_parser.js` 照样能解析。
+
+```powershell
+node examples/ws-relay-gateway.js --port 9100    # 零依赖网关，GET /peers 看在线节点
+node examples/ws-rpc-demo.js                     # 端到端自检：11 项断言
+```
+
+适配器 `examples/browser/ws-transport.js` 把一条 WS 连接伪装成 `net.Socket`，
+Node 侧可直接套现有 `MessageStream + RpcProtocol`；浏览器侧需要配前端精简栈（详见该目录 README）。
+信封格式、边界与限制见 [examples/browser/README.md](examples/browser/README.md)。
+
 ### 跨语言互操作示例
 
 任选一端做服务端、另一端做客户端（以下为 Windows 命令）：
