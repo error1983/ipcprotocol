@@ -146,7 +146,9 @@
 <script type="module">
 import { WsTransport } from './ws-transport.js';
 import { MiniMessageStream } from './mini-stream.js';
-import { MiniRpc } from './mini-rpc.js';
+// 这一行就是全部差别：把 mini-rpc 换成本仓 Node 版同形的 compat 层，
+// 下面的业务代码与 Node 端示例完全一致（registerMethod / hello / sendRequest / on('event')）
+import { RpcProtocol } from './rpc-protocol-compat.js';
 
 const $ = (id) => document.getElementById(id);
 const logEl = $('log');
@@ -205,7 +207,7 @@ async function connect() {
         stream = new MiniMessageStream(link);
         stream.on('error', (err) => log(`stream: ${err.code} ${err.message}`, 'er'));
 
-        rpc = new MiniRpc(stream, { implName: `browser/${peer}`, heartbeatIntervalMs: 5000 });
+        rpc = new RpcProtocol(stream, { implName: `browser/${peer}`, heartbeatIntervalMs: 5000 });
         rpc.on('error', (err) => log(`rpc: ${err.code} ${err.message}`, 'er'));
         rpc.on('event', (msg) => {
             const body = msg.content instanceof Uint8Array ? `binary ${hex(msg.content)}` : JSON.stringify(msg.content);

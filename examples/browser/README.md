@@ -34,6 +34,7 @@
 | `ws-transport.js` | 传输适配器：把一条 WS 连接伪装成 `net.Socket`（`on`/`write`/`destroy`/`drain`） |
 | `mini-stream.js` | 浏览器帧层：纯 `Uint8Array`，无 Node 依赖，线格式与 `MessageStream` 逐字节一致 |
 | `mini-rpc.js` | 浏览器 RPC 层：REQUEST/RESPONSE/EVENT/PING/PONG/HELLO/HELLO_ACK + 鉴权 + 二进制请求体 |
+| `rpc-protocol-compat.js` | 把上面两层包成 **Node 版 `RpcProtocol` 的接口形状**，业务代码两端一字不改 |
 | `rpc-demo.html` | 双浏览器互调演示页（两个标签页各当一个 peer，点按钮互相调） |
 | `serve.js` | 零依赖静态服务器（`type=module` 不能用 `file://` 打开，需要它） |
 
@@ -100,9 +101,53 @@ await rpc.sendRequestBinary('upload', new Uint8Array([1, 2, 3]), 'tag');
 | mini（浏览器） ↔ mini（浏览器） | ✅ 同上 |
 | Node `MessageStream` ↔ WS / 命名管道 / TCP | ✅ 原样支持 |
 
+## 同一套写法：compat 层（推荐业务代码用它）
+
+`mini-stream.js` + `mini-rpc.js` 是「两层分开」的低层 API。如果希望**前端和 Node 端的业务代码一字不改**，
+用 `rpc-protocol-compat.js`：它把这两层包成 Node 版 `RpcProtocol` 的接口形状，两端只差一行 import。
+
+```js
+// Node 端（进程 / 子进程 / 本机服务）
+import { RpcProtocol, RpcError } from '../../RpcProtocol.js';
+// 浏览器端
+import { RpcProtocol, RpcError } from './rpc-protocol-compat.js';
+
+// ——— 下面这部分两端完全相同 ———
+const rpc = new RpcProtocol(stream, { authToken, implName: 'demo', heartbeatIntervalMs: 5000 });
+rpc.registerMethod('add', (a, b) => a + b);
+rpc.handlers.mul = (a, b) => a * b;          // handlers 对象写法也支持
+rpc.on('event', (msg) => console.log(msg.contentType, msg.content));
+rpc.on('error', (err) => console.warn(err.code));
+
+await rpc.hello();
+console.log(await rpc.sendRequest('add', [1, 2]), await rpc.sendRequestBinary('upload', bytes, 'tag'));
+```
+
+对齐的东西：构造参数字段名与默认值、`hello/sendRequest/sendRequestBinary/sendResponse/sendRaw/onEvent/
+registerMethod/sendText/sendJson/sendBinary/destroy/setRequiredTokens/handleMessage`、
+`handlers`（普通对象，内部同步给 mini 层）、`pendingRequests`、`peerCapabilities`、`serverCapabilities`、
+`heartbeatDisabledReason` 等属性、`'event' / 'error' / 'heartbeatDisabled'` 事件、
+以及静态的 `TYPES / CONTENT_TYPES / serialize / deserialize / encodeBinaryRequest / decodeBinaryRequest`。
+
+无法对齐的部分（浏览器环境固有限制，不是 bug）：
+
+| 差异 | 说明 |
+|---|---|
+| 二进制容器 | 浏览器里是 `Uint8Array`（没有 `Buffer`），Node 侧拿到 `Buffer` |
+| `sendRequest` 的 `to` | 被忽略。IPC 帧没有目标地址，路由由 WS 网关的传输层信封负责 |
+| 对端数量 | 一条链路一个对端；Node 版可做多客户端路由 |
+| `heartbeatSkipWhilePending` | 恒为 `true`（有在途请求不判超时），设置 `false` 会打一条警告 |
+| token 轮换 | `setRequiredTokens` 立即整体替换，没有宽限期语义 |
+| `RpcError.data` | 远程错误只保留 `code='EREMOTE'` 与 message，不带 `data` |
+
+已用同一段 scenario 代码分别跑 Node 版与 compat 版，逐项比对 29 个观察点全部一致；
+另在真实 WS 链路（compat ↔ Node 原版）上验证 13 项：握手、双向调用、二进制、`handlers` 写法、
+错误传播、超时、事件、跨心跳保活、静态编解码。
+
 ## 双浏览器互调演示
 
-`rpc-demo.html` 就是上面这套栈的可视化版，两个标签页互相调：
+`rpc-demo.html` 就是 compat 层的可视化版（页面里的调用代码与 Node 示例完全一致，
+差别只有 `import { RpcProtocol } from './rpc-protocol-compat.js'` 这一行），两个标签页互相调：
 
 ```powershell
 node examples/ws-relay-gateway.js --port 9100
